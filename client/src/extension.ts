@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as cheerio from 'cheerio';
+import JSZip = require('jszip');
 
 import {
     LanguageClient,
@@ -18,6 +19,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(registerNewPowerCommand());
     context.subscriptions.push(registerDocumentationViewerCommand());
     context.subscriptions.push(registerInitializeAddonCommand());
+    context.subscriptions.push(registerPackageAddonCommand());
 
     const serverModule = context.asAbsolutePath("dist/server.js");
 
@@ -258,13 +260,15 @@ function registerInitializeAddonCommand(): vscode.Disposable {
                 segments: ["META-INF", "mods.toml"],
                 contents:
 `modLoader="lowcodefml"
-"showAsResourcePack = false
+showAsResourcePack = false
 loaderVersion="[47,)"
 license="All Rights Reserved"
 
 [[mods]]
 modId="${modId}"
 version="1.0.0"
+logoFile = "logo.png"
+logoBlur = false
 displayName="${safeDisplayNameToml}"
 description='''
 ${description}
@@ -282,7 +286,8 @@ side = "BOTH"
                 segments: ["fabric.mod.json"],
                 contents: JSON.stringify({
                     schemaVersion: 1,
-                    authors: author,
+                    authors: [author],
+                    environment: "*",
                     id: modId,
                     version: "1.0.0",
                     name: displayName,
@@ -330,6 +335,57 @@ side = "BOTH"
             const message = error instanceof Error ? error.message : String(error);
             vscode.window.showWarningMessage(`Addon created, but Git initialization failed: ${message}`);
             vscode.window.showInformationMessage(`Initialized addon "${displayName}" in ${vscode.workspace.asRelativePath(addonRoot)}.`);
+        }
+    });
+}
+
+function registerPackageAddonCommand(): vscode.Disposable {
+    return vscode.commands.registerCommand("palladiumsense.packageAddon", async () => {
+        const workspaceFolder = await pickWorkspaceFolder();
+        if (!workspaceFolder) {
+            vscode.window.showErrorMessage("Open your Minecraft instance as a workspace folder before packaging an addon.");
+            return;
+        }
+
+        const modIdInput = await vscode.window.showInputBox({
+            title: "Addon Mod ID",
+            prompt: "Enter the mod ID to package",
+            placeHolder: "examplemod",
+            validateInput: value => /^[a-z0-9_]+$/.test(value.trim())
+                ? undefined
+                : "Mod ID must be lowercase letters, numbers, or underscores"
+        });
+
+        if (!modIdInput) {
+            return;
+        }
+
+        const modId = modIdInput.trim().toLowerCase();
+        const selection = await pickAddonPackByModId(workspaceFolder.uri, modId);
+        if (!selection) {
+            vscode.window.showErrorMessage(`Could not find an addon pack with data/${modId}.`);
+            return;
+        }
+
+        const packagedRoot = vscode.Uri.joinPath(workspaceFolder.uri, "packaged_addons");
+        try {
+            await vscode.workspace.fs.createDirectory(packagedRoot);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Failed to prepare packaged_addons folder: ${message}`);
+            return;
+        }
+
+        const timestamp = formatTimestampForFile(new Date());
+        const jarUri = vscode.Uri.joinPath(packagedRoot, `${modId}-${timestamp}.jar`);
+
+        try {
+            const archive = await createAddonArchive(selection.root);
+            await vscode.workspace.fs.writeFile(jarUri, archive);
+            vscode.window.showInformationMessage(`Packaged addon "${selection.label}" to ${vscode.workspace.asRelativePath(jarUri)}.`);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Failed to package addon: ${message}`);
         }
     });
 }
@@ -427,6 +483,8 @@ type DocEntry = {
     example?: string;
 };
 
+type AddonPackPickItem = vscode.QuickPickItem & { root: vscode.Uri };
+
 type GitAPI = {
     init(root: vscode.Uri): Promise<unknown>;
 };
@@ -480,6 +538,61 @@ function buildAddonFolderName(displayName: string, fallback: string): string {
     return sanitizedFallback || "AddonPack";
 }
 
+function formatTimestampForFile(date: Date): string {
+    const pad = (value: number) => value.toString().padStart(2, "0");
+    return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+async function createAddonArchive(root: vscode.Uri): Promise<Uint8Array> {
+    const zip = new JSZip();
+    await addFolderToZip(zip, root, "");
+    return zip.generateAsync({
+        type: "uint8array",
+        compression: "DEFLATE",
+        compressionOptions: { level: 9 }
+    });
+}
+
+async function addFolderToZip(zip: JSZip, folderUri: vscode.Uri, relativePath: string): Promise<void> {
+    const entries = await vscode.workspace.fs.readDirectory(folderUri);
+    for (const [name, type] of entries) {
+        if (name === ".git") {
+            continue;
+        }
+
+        const childUri = vscode.Uri.joinPath(folderUri, name);
+        const relPath = relativePath ? `${relativePath}/${name}` : name;
+        const normalizedPath = relPath.replace(/\\/g, "/");
+
+        if ((type & vscode.FileType.Directory) !== 0) {
+            zip.folder(normalizedPath);
+            await addFolderToZip(zip, childUri, normalizedPath);
+            continue;
+        }
+
+        if ((type & vscode.FileType.File) !== 0) {
+            const contents = await vscode.workspace.fs.readFile(childUri);
+            zip.file(normalizedPath, contents);
+            continue;
+        }
+
+        if ((type & vscode.FileType.SymbolicLink) !== 0) {
+            try {
+                const stat = await vscode.workspace.fs.stat(childUri);
+                if ((stat.type & vscode.FileType.Directory) !== 0) {
+                    zip.folder(normalizedPath);
+                    await addFolderToZip(zip, childUri, normalizedPath);
+                } else if ((stat.type & vscode.FileType.File) !== 0) {
+                    const contents = await vscode.workspace.fs.readFile(childUri);
+                    zip.file(normalizedPath, contents);
+                }
+            } catch {
+                // Ignore broken symlinks
+            }
+        }
+    }
+}
+
 type PowerDirPickItem = vscode.QuickPickItem & { target: vscode.Uri };
 
 async function findPowerDirectory(workspaceUri: vscode.Uri, modId: string): Promise<vscode.Uri | undefined> {
@@ -526,6 +639,51 @@ async function findPowerDirectory(workspaceUri: vscode.Uri, modId: string): Prom
     });
 
     return selection?.target;
+}
+
+async function pickAddonPackByModId(workspaceUri: vscode.Uri, modId: string): Promise<AddonPackPickItem | undefined> {
+    const addonpacksUri = vscode.Uri.joinPath(workspaceUri, "addonpacks");
+    let entries: [string, vscode.FileType][];
+
+    try {
+        entries = await vscode.workspace.fs.readDirectory(addonpacksUri);
+    } catch {
+        vscode.window.showErrorMessage("Could not access addonpacks folder.");
+        return undefined;
+    }
+
+    const matches: AddonPackPickItem[] = [];
+    for (const [name, type] of entries) {
+        if ((type & vscode.FileType.Directory) === 0) {
+            continue;
+        }
+
+        const packRoot = vscode.Uri.joinPath(addonpacksUri, name);
+        const dataDir = vscode.Uri.joinPath(packRoot, "data", modId);
+        if (!(await directoryExists(dataDir))) {
+            continue;
+        }
+
+        matches.push({
+            label: name,
+            description: vscode.workspace.asRelativePath(packRoot),
+            root: packRoot
+        });
+    }
+
+    if (matches.length === 0) {
+        return undefined;
+    }
+
+    if (matches.length === 1) {
+        return matches[0];
+    }
+
+    const selection = await vscode.window.showQuickPick(matches, {
+        placeHolder: `Select the addon pack that contains data/${modId}`
+    });
+
+    return selection as AddonPackPickItem | undefined;
 }
 
 async function directoryExists(uri: vscode.Uri): Promise<boolean> {
