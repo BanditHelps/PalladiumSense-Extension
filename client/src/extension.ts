@@ -659,37 +659,6 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
             display: none !important;
         }
 
-        #context-menu {
-            position: fixed;
-            z-index: 20;
-            min-width: 180px;
-            background: var(--panel-alt);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 8px;
-            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.35);
-            padding: 4px 0;
-            display: none;
-        }
-
-        #context-menu.visible {
-            display: block;
-        }
-
-        #context-menu button {
-            display: block;
-            width: 100%;
-            padding: 8px 16px;
-            background: transparent;
-            border: none;
-            color: inherit;
-            text-align: left;
-            font-size: 0.95rem;
-            cursor: pointer;
-        }
-
-        #context-menu button:hover {
-            background: rgba(255, 255, 255, 0.07);
-        }
     </style>
 </head>
 <body>
@@ -699,20 +668,12 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
     </header>
     <nav id="tab-bar"></nav>
     <main id="docs"></main>
-    <div id="context-menu">
-        <button data-action="insert">Insert into Editor</button>
-        <button data-action="copy">Copy JSON</button>
-    </div>
     <script nonce="${nonce}">
         const data = ${data};
         const tabs = document.getElementById("tab-bar");
         const container = document.getElementById("docs");
         const input = document.getElementById("search");
-        const menu = document.getElementById("context-menu");
         let activeTab = data[0]?.title ?? "";
-        let menuTarget = null;
-
-        const vscode = acquireVsCodeApi();
 
         const createEntry = (entry, sectionTitle) => {
             const article = document.createElement("article");
@@ -792,7 +753,6 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
 
         const setActiveTab = (title) => {
             activeTab = title;
-            hideMenu();
             document.querySelectorAll(".tab-button").forEach(btn => {
                 btn.classList.toggle("active", btn.dataset.section === title);
             });
@@ -823,58 +783,7 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
         setActiveTab(activeTab);
         applySearch();
 
-        const hideMenu = () => {
-            menu.classList.remove("visible");
-            menuTarget = null;
-        };
-
-        container.addEventListener("contextmenu", event => {
-            const entry = event.target.closest(".doc-entry");
-            if (!entry) {
-                hideMenu();
-                return;
-            }
-            event.preventDefault();
-            menuTarget = entry;
-            menu.style.top = event.clientY + "px";
-            menu.style.left = event.clientX + "px";
-            menu.classList.add("visible");
-        });
-
-        document.addEventListener("click", event => {
-            if (!menu.contains(event.target)) {
-                hideMenu();
-            }
-        });
-
-        window.addEventListener("blur", hideMenu);
-
-        menu.addEventListener("click", event => {
-            const button = event.target.closest("button[data-action]");
-            if (!button || !menuTarget) {
-                return;
-            }
-
-            const action = button.dataset.action;
-            const example = menuTarget.dataset.example;
-            const section = menuTarget.dataset.section;
-            if (!example) {
-                hideMenu();
-                return;
-            }
-
-            vscode.postMessage({
-                type: action === "insert" ? "insertEntry" : "copyEntry",
-                entryId: menuTarget.id,
-                example,
-                section
-            });
-
-            hideMenu();
-        });
-
         input.addEventListener("input", () => {
-            hideMenu();
             applySearch();
         });
     </script>
