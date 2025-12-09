@@ -151,24 +151,26 @@ connection.onCompletion(
 
         const ctx = resolveCompletionContext(doc, params.position);
         if (ctx === "condition") {
+            const needsComma = shouldAddTrailingComma(doc, params.position);
             return conditions.map(c => ({
                 label: c.name,
                 kind: CompletionItemKind.Snippet,
                 detail: c.id,
                 documentation: buildDocumentationSummary(c),
                 insertTextFormat: InsertTextFormat.Snippet,
-                insertText: c.snippet,
+                insertText: needsComma ? `${c.snippet},` : c.snippet,
             }));
         }
 
         if (ctx === "ability") {
+            const needsComma = shouldAddTrailingComma(doc, params.position);
             return abilities.map(a => ({
                 label: a.name,
                 kind: CompletionItemKind.Snippet,
                 detail: a.id,
                 documentation: buildDocumentationSummary(a),
                 insertTextFormat: InsertTextFormat.Snippet,
-                insertText: a.snippet,
+                insertText: needsComma ? `${a.snippet},` : a.snippet,
             }));
         }
 
@@ -328,6 +330,27 @@ function resolveCompletionContext(document: TextDocument, position: Position): D
     }
 
     return undefined;
+}
+
+function shouldAddTrailingComma(document: TextDocument, position: Position): boolean {
+    const text = document.getText();
+    const offset = document.offsetAt(position);
+
+    for (let idx = offset; idx < text.length; idx++) {
+        const char = text.charAt(idx);
+
+        if (char === " " || char === "\t" || char === "\r" || char === "\n") {
+            continue;
+        }
+
+        if (char === "}" || char === "]") {
+            return false;
+        }
+
+        return true;
+    }
+
+    return false;
 }
 
 function determineDocKind(document: TextDocument, objectNode: JsonNode): DocKind | undefined {
@@ -1063,7 +1086,7 @@ function buildSnippetFromExample(example: string): { snippet: string; pretty: st
                 }
 
                 const lines = entries.map(([key, val]) => `${nextIndent}"${key}": ${renderValue(val, depth + 1)}`);
-                return `{\n${lines.join(",\n")}\n${indent}},`;
+                return `{\n${lines.join(",\n")}\n${indent}}`;
             }
 
             return buildPrimitiveSnippet(value);
