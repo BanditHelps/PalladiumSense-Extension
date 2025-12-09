@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-
+import * as cheerio from 'cheerio';
 
 import {
     LanguageClient,
@@ -16,6 +16,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 	// Register the "Power" command
     context.subscriptions.push(registerNewPowerCommand());
+    context.subscriptions.push(registerDocumentationViewerCommand());
 
     const serverModule = context.asAbsolutePath("dist/server.js");
 
@@ -143,6 +144,53 @@ function registerNewPowerCommand(): vscode.Disposable {
     });
 }
 
+function registerDocumentationViewerCommand(): vscode.Disposable {
+    return vscode.commands.registerCommand("palladiumsense.viewDocumentation", async () => {
+        const workspaceFolder = await pickWorkspaceFolder();
+        if (!workspaceFolder) {
+            vscode.window.showErrorMessage("Open your Minecraft instance as a workspace folder before viewing documentation.");
+            return;
+        }
+
+        const docsRoot = vscode.Uri.joinPath(workspaceFolder.uri, "mods", "documentation", "palladium");
+        if (!(await directoryExists(docsRoot))) {
+            vscode.window.showErrorMessage("Could not find mods/documentation/palladium under the selected workspace.");
+            return;
+        }
+
+        const sections = await loadDocumentationSections(docsRoot);
+        if (!sections.length) {
+            vscode.window.showWarningMessage("No documentation files were found in mods/documentation/palladium.");
+            return;
+        }
+
+        const panel = vscode.window.createWebviewPanel(
+            "palladiumDocumentation",
+            "Palladium Documentation",
+            vscode.ViewColumn.Active,
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true,
+            }
+        );
+
+        panel.webview.html = buildDocumentationWebviewContent(panel.webview, sections);
+    });
+}
+
+type DocSection = {
+    title: string;
+    entries: DocEntry[];
+};
+
+type DocEntry = {
+    id: string;
+    title: string;
+    description?: string;
+    html: string;
+    searchText: string;
+};
+
 async function pickWorkspaceFolder(): Promise<vscode.WorkspaceFolder | undefined> {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) {
@@ -241,7 +289,280 @@ function buildPowerTemplate(name: string, guiDisplayType: string): string {
     "gui_display_type": "${guiDisplayType}",
     "abilities": {
 
+    }`;
+}
+
+async function loadDocumentationSections(docsRoot: vscode.Uri): Promise<DocSection[]> {
+    const candidates = [
+        { file: "abilities.html", title: "Abilities" },
+        { file: "conditions.html", title: "Conditions" }
+    ];
+
+    const sections: DocSection[] = [];
+
+    for (const candidate of candidates) {
+        const target = vscode.Uri.joinPath(docsRoot, candidate.file);
+        if (!(await fileExists(target))) {
+            continue;
+        }
+
+        const section = await parseDocumentationFile(target, candidate.title);
+        if (section && section.entries.length) {
+            sections.push(section);
+        }
+    }
+
+    return sections;
+}
+
+async function parseDocumentationFile(fileUri: vscode.Uri, title: string): Promise<DocSection | null> {
+    try {
+        const raw = await vscode.workspace.fs.readFile(fileUri);
+        const contents = raw.toString();
+        const entries = extractDocumentationEntries(contents);
+        return entries.length ? { title, entries } : null;
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showWarningMessage(`Unable to read ${path.basename(fileUri.fsPath)}: ${message}`);
+        return null;
     }
 }
-`;
+
+function extractDocumentationEntries(html: string): DocEntry[] {
+    const $ = cheerio.load(html);
+    const result: DocEntry[] = [];
+
+    $("div[id]").each((_idx, element) => {
+        const block = $(element);
+        const id = block.attr("id")?.trim();
+        if (!id || !id.includes(":")) {
+            return;
+        }
+
+        block.find("script").remove();
+
+        const title = block.find("h2").first().text().trim() || id;
+        const description = block.find("p").first().text().trim();
+        const htmlContent = block.html() ?? "";
+        const textContent = block.text().replace(/\s+/g, " ").trim().toLowerCase();
+        const searchText = [id, title, description, textContent].filter(Boolean).join(" ").toLowerCase();
+
+        result.push({
+            id,
+            title,
+            description,
+            html: htmlContent,
+            searchText,
+        });
+    });
+
+    return result;
+}
+
+function buildDocumentationWebviewContent(webview: vscode.Webview, sections: DocSection[]): string {
+    const payload = sections.map(section => ({
+        title: section.title,
+        entries: section.entries.map(entry => ({
+            id: entry.id,
+            title: entry.title,
+            description: entry.description,
+            html: entry.html,
+            searchText: entry.searchText
+        }))
+    }));
+
+    const data = JSON.stringify(payload);
+    const nonce = Date.now().toString(36);
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' ${webview.cspSource}; script-src 'nonce-${nonce}';" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Palladium Documentation</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            font-family: "Segoe UI", sans-serif;
+            --bg: #111417;
+            --panel: #1c2127;
+            --border: #2a2f35;
+            --accent: #4aa8ff;
+            --text-muted: #b5bcc6;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg);
+            color: #f5f7fa;
+        }
+
+        header {
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            background: rgba(17, 20, 23, 0.95);
+            backdrop-filter: blur(6px);
+            padding: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        h1 {
+            margin: 0 0 8px 0;
+            font-size: 1.4rem;
+        }
+
+        #search {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--panel);
+            color: inherit;
+            font-size: 0.95rem;
+        }
+
+        #docs {
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        .doc-section {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px;
+        }
+
+        .doc-section h2 {
+            margin: 0 0 12px 0;
+            font-size: 1.2rem;
+        }
+
+        .doc-entries {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .doc-entry {
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: #15191e;
+            padding: 16px;
+        }
+
+        .doc-entry header {
+            position: static;
+            background: transparent;
+            border-bottom: none;
+            padding: 0;
+            margin-bottom: 12px;
+        }
+
+        .doc-entry h3 {
+            margin: 0;
+        }
+
+        .doc-entry small {
+            color: var(--text-muted);
+        }
+
+        .doc-entry-body {
+            overflow-x: auto;
+        }
+
+        pre {
+            background: #0f1115;
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+
+        details summary {
+            cursor: pointer;
+            margin-bottom: 8px;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Palladium Documentation</h1>
+        <input id="search" type="search" placeholder="Search by name, ID, or description..." />
+    </header>
+    <main id="docs"></main>
+    <script nonce="${nonce}">
+        const data = ${data};
+        const container = document.getElementById("docs");
+
+        const createEntry = (entry) => {
+            const article = document.createElement("article");
+            article.className = "doc-entry";
+            article.dataset.search = entry.searchText;
+            article.id = entry.id.replace(/[^\\w-]+/g, "_");
+
+            const header = document.createElement("header");
+            const title = document.createElement("h3");
+            title.textContent = entry.title;
+            const meta = document.createElement("small");
+            meta.textContent = entry.id;
+
+            header.appendChild(title);
+            header.appendChild(meta);
+
+            article.appendChild(header);
+
+            if (entry.description) {
+                const desc = document.createElement("p");
+                desc.textContent = entry.description;
+                article.appendChild(desc);
+            }
+
+            const body = document.createElement("div");
+            body.className = "doc-entry-body";
+            body.innerHTML = entry.html;
+            article.appendChild(body);
+
+            return article;
+        };
+
+        data.forEach(section => {
+            const sectionEl = document.createElement("section");
+            sectionEl.className = "doc-section";
+
+            const title = document.createElement("h2");
+            title.textContent = section.title;
+            sectionEl.appendChild(title);
+
+            const entriesWrapper = document.createElement("div");
+            entriesWrapper.className = "doc-entries";
+            section.entries.forEach(entry => {
+                entriesWrapper.appendChild(createEntry(entry));
+            });
+
+            sectionEl.appendChild(entriesWrapper);
+            container.appendChild(sectionEl);
+        });
+
+        const input = document.getElementById("search");
+        input.addEventListener("input", () => {
+            const query = input.value.trim().toLowerCase();
+            const entries = document.querySelectorAll(".doc-entry");
+
+            entries.forEach(entry => {
+                const haystack = entry.dataset.search ?? "";
+                entry.classList.toggle("hidden", query.length > 1 && !haystack.includes(query));
+            });
+        });
+    </script>
+</body>
+</html>`;
 }

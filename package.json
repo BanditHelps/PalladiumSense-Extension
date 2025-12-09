@@ -18,6 +18,10 @@
       {
         "command": "palladiumsense.newPower",
         "title": "New Power"
+      },
+      {
+        "command": "palladiumsense.viewDocumentation",
+        "title": "View Palladium Documentation"
       }
     ]
   },
