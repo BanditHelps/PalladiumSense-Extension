@@ -912,12 +912,12 @@ async function reloadConditions(reason?: string): Promise<void> {
 async function resolveAbilities(config: InitOptions): Promise<ResolveResult> {
     const abilityFile = getAbilityFilePath(config);
     if (abilityFile && await fileExists(abilityFile)) {
-        const entries = await loadFromFile(abilityFile, path.basename(abilityFile));
+        const entries = await loadFromFile(abilityFile, path.basename(abilityFile), "ability");
         return { entries, watchTarget: { kind: "file" as const, path: abilityFile } };
     }
 
     const bundledPath = path.resolve(__dirname, "..", "..", "examples", "abilities.html");
-    const fallbackList = await loadFromFile(bundledPath, "examples/abilities.html");
+    const fallbackList = await loadFromFile(bundledPath, "examples/abilities.html", "ability");
     const watchTarget = config.docsRoot ? { kind: "folder" as const, path: config.docsRoot } : null;
     return { entries: fallbackList.length ? fallbackList : createFallbackAbilities(), watchTarget };
 }
@@ -925,7 +925,7 @@ async function resolveAbilities(config: InitOptions): Promise<ResolveResult> {
 async function resolveConditions(config: InitOptions): Promise<ResolveResult> {
     const conditionFile = getConditionFilePath(config);
     if (conditionFile && await fileExists(conditionFile)) {
-        const entries = await loadFromFile(conditionFile, path.basename(conditionFile));
+        const entries = await loadFromFile(conditionFile, path.basename(conditionFile), "condition");
         return { entries, watchTarget: { kind: "file" as const, path: conditionFile } };
     }
 
@@ -933,7 +933,7 @@ async function resolveConditions(config: InitOptions): Promise<ResolveResult> {
     return { entries: [], watchTarget };
 }
 
-async function loadFromFile(filePath: string, sourceLabel: string): Promise<AbilityRecord[]> {
+async function loadFromFile(filePath: string, sourceLabel: string, docKind: DocKind): Promise<AbilityRecord[]> {
     try {
         const stats = await fsp.stat(filePath);
         if (!stats.isFile()) {
@@ -941,14 +941,14 @@ async function loadFromFile(filePath: string, sourceLabel: string): Promise<Abil
         }
 
         const html = await fsp.readFile(filePath, "utf8");
-        return parseAbilityHtml(html, sourceLabel);
+        return parseAbilityHtml(html, sourceLabel, docKind);
     } catch (error) {
         connection.console.warn(`[Abilities] Unable to read file ${filePath}: ${formatError(error)}`);
         return [];
     }
 }
 
-function parseAbilityHtml(html: string, sourceLabel: string): AbilityRecord[] {
+function parseAbilityHtml(html: string, sourceLabel: string, docKind: DocKind): AbilityRecord[] {
     const $ = cheerio.load(html);
     const result: AbilityRecord[] = [];
 
@@ -973,7 +973,7 @@ function parseAbilityHtml(html: string, sourceLabel: string): AbilityRecord[] {
         const description = block.find("p").first().text().trim();
         const fields = parseAbilityFields($, block);
         const fieldIndex = new Map(fields.map(field => [field.name, field]));
-        const { snippet, pretty } = buildSnippetFromExample(exampleRaw);
+        const { snippet, pretty } = buildSnippetFromExample(exampleRaw, docKind);
 
         result.push({
             id,
@@ -1061,9 +1061,18 @@ function parseRequiredFlag(raw: string): boolean | undefined {
 }
 
 // This is where the snippets get added
-function buildSnippetFromExample(example: string): { snippet: string; pretty: string } {
+function buildSnippetFromExample(example: string, kind: DocKind): { snippet: string; pretty: string } {
     try {
         const parsed = JSON.parse(example);
+        const snippetRoot =
+            kind === "ability"
+                ? cloneJsonValue(parsed)
+                : parsed;
+
+        if (kind === "ability") {
+            ensureAbilityConditions(snippetRoot);
+        }
+
         let tabIndex = 1;
 
         const renderValue = (value: unknown, depth: number): string => {
@@ -1104,12 +1113,51 @@ function buildSnippetFromExample(example: string): { snippet: string; pretty: st
             return placeholder;
         };
 
-        const snippet = renderValue(parsed, 0);
+        const snippet = renderValue(snippetRoot, 0);
         const pretty = JSON.stringify(parsed, null, 4);
         return { snippet, pretty };
     } catch {
         return { snippet: example, pretty: example };
     }
+}
+
+function ensureAbilityConditions(root: unknown): void {
+    if (!isPlainObject(root)) {
+        return;
+    }
+
+    const record = root as Record<string, unknown>;
+    const existing = record["conditions"];
+
+    if (!isPlainObject(existing)) {
+        record["conditions"] = createEmptyConditionsBlock();
+        return;
+    }
+
+    const conditions = existing as Record<string, unknown>;
+
+    if (!Array.isArray(conditions["enabling"])) {
+        conditions["enabling"] = [];
+    }
+
+    if (!Array.isArray(conditions["unlocking"])) {
+        conditions["unlocking"] = [];
+    }
+}
+
+function createEmptyConditionsBlock(): { enabling: unknown[]; unlocking: unknown[] } {
+    return {
+        enabling: [],
+        unlocking: []
+    };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function cloneJsonValue<T>(value: T): T {
+    return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function escapeSnippet(value: string): string {
@@ -1191,18 +1239,26 @@ function createFallbackAbilities(): AbilityRecord[] {
 
     return [
         {
-            id: "bandits_quirk_lib:blackwhip_detach",
-            name: "blackwhip_detach",
+            id: "palladium:dummy",
+            name: "Fallback Power",
             description: "Sample data – real abilities load from mods/documentation/palladium.",
             example: `{
-    "type": "bandits_quirk_lib:blackwhip_detach",
+    "type": "palladium:blackwhip_detach",
     "power": 1,
-    "cooldown": 10
+    "cooldown": 10,
+    "conditions": {
+        "enabling": [],
+        "unlocking": []
+    }
 }`,
             snippet: `{
-    "type": "bandits_quirk_lib:blackwhip_detach",
+    "type": "palladium:dummy",
     "power": \${1:1},
-    "cooldown": \${2:10}
+    "cooldown": \${2:10},
+    "conditions": {
+        "enabling": [],
+        "unlocking": []
+    }
 }`,
             fields,
             fieldIndex: new Map(fields.map(field => [field.name, field]))
