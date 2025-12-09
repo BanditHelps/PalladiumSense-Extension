@@ -339,19 +339,51 @@ function buildPowerTemplate(name: string, guiDisplayType: string): string {
 }
 
 async function loadDocumentationSections(docsRoot: vscode.Uri): Promise<DocSection[]> {
-    const candidates = [
-        { file: "abilities.html", title: "Abilities" },
-        { file: "conditions.html", title: "Conditions" }
-    ];
+    let directoryEntries: [string, vscode.FileType][];
+    try {
+        directoryEntries = await vscode.workspace.fs.readDirectory(docsRoot);
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        vscode.window.showWarningMessage(`Unable to read documentation directory: ${message}`);
+        return [];
+    }
+
+    const htmlFiles = directoryEntries
+        .filter(([, type]) => type === vscode.FileType.File)
+        .map(([name]) => name)
+        .filter(name => name.toLowerCase().endsWith(".html"));
+
+    if (!htmlFiles.length) {
+        return [];
+    }
+
+    const normalized = new Map<string, string>();
+    htmlFiles.forEach(name => normalized.set(name.toLowerCase(), name));
+
+    const orderedCandidates: { file: string; title: string }[] = [];
+
+    const pushSpecial = (key: string, title: string) => {
+        const actual = normalized.get(key);
+        if (!actual) {
+            return;
+        }
+        orderedCandidates.push({ file: actual, title });
+        normalized.delete(key);
+    };
+
+    pushSpecial("abilities.html", "Abilities");
+    pushSpecial("conditions.html", "Conditions");
+
+    Array.from(normalized.values())
+        .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }))
+        .forEach(file => {
+            orderedCandidates.push({ file, title: formatDocTitle(file) });
+        });
 
     const sections: DocSection[] = [];
 
-    for (const candidate of candidates) {
+    for (const candidate of orderedCandidates) {
         const target = vscode.Uri.joinPath(docsRoot, candidate.file);
-        if (!(await fileExists(target))) {
-            continue;
-        }
-
         const section = await parseDocumentationFile(target, candidate.title);
         if (section && section.entries.length) {
             sections.push(section);
@@ -359,6 +391,19 @@ async function loadDocumentationSections(docsRoot: vscode.Uri): Promise<DocSecti
     }
 
     return sections;
+}
+
+function formatDocTitle(fileName: string): string {
+    const base = fileName.replace(/\.html$/i, "");
+    const withSpaces = base.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+    const parts = withSpaces.split(/[\s_-]+/).filter(Boolean);
+    if (!parts.length) {
+        return base;
+    }
+
+    return parts
+        .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ");
 }
 
 async function parseDocumentationFile(fileUri: vscode.Uri, title: string): Promise<DocSection | null> {
