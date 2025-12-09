@@ -1010,9 +1010,6 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
             padding: 12px 24px;
             border-bottom: 1px solid var(--border);
             background: var(--bg);
-            position: sticky;
-            top: 72px;
-            z-index: 9;
             justify-content: flex-start;
             align-items: center;
             flex-wrap: wrap;
@@ -1117,6 +1114,53 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
             color: #e5f0ff;
         }
 
+        .example-block {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--panel-alt);
+            overflow: hidden;
+        }
+
+        .example-block summary {
+            list-style: none;
+            cursor: pointer;
+            padding: 10px 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+            color: var(--text-muted);
+            user-select: none;
+        }
+
+        .example-block summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .example-block summary::before {
+            content: "▶";
+            font-size: 0.7rem;
+            transition: transform 0.15s ease;
+            color: var(--text-muted);
+        }
+
+        .example-block[open] summary::before {
+            transform: rotate(90deg);
+        }
+
+        .example-block[open] summary {
+            color: #fff;
+            border-bottom: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.04);
+        }
+
+        .example-block pre {
+            margin: 0;
+            border: none;
+            border-radius: 0;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
         .doc-entry table {
             width: 100%;
             border-collapse: collapse;
@@ -1174,12 +1218,43 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
         const input = document.getElementById("search");
         let activeTab = data[0]?.title ?? "";
 
+        const collapseExamples = (root) => {
+            const preBlocks = Array.from(root.querySelectorAll("pre"));
+            preBlocks.forEach((pre, idx) => {
+                if (pre.closest(".example-block")) {
+                    return;
+                }
+
+                const details = document.createElement("details");
+                details.className = "example-block";
+
+                const summary = document.createElement("summary");
+                const heading = pre.previousElementSibling;
+                if (heading && /^H[1-6]$/i.test(heading.tagName) && heading.textContent?.trim()) {
+                    summary.textContent = heading.textContent.trim();
+                    heading.remove();
+                } else {
+                    summary.textContent = \`Example \${idx + 1}\`;
+                }
+
+                const parent = pre.parentElement;
+                if (!parent) {
+                    return;
+                }
+
+                parent.insertBefore(details, pre);
+                details.appendChild(summary);
+                details.appendChild(pre);
+            });
+        };
+
         const createEntry = (entry, sectionTitle) => {
             const article = document.createElement("article");
             article.className = "doc-entry";
             article.dataset.search = entry.searchText;
             article.id = entry.id.replace(/[^\\w-]+/g, "_");
             article.dataset.section = sectionTitle;
+            article.dataset.id = entry.id.toLowerCase();
             if (entry.example) {
                 article.dataset.example = entry.example;
             }
@@ -1205,6 +1280,7 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
             const body = document.createElement("div");
             body.className = "doc-entry-body";
             body.innerHTML = entry.html;
+            collapseExamples(body);
             article.appendChild(body);
 
             return article;
@@ -1261,10 +1337,24 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
         };
 
         const applySearch = () => {
-            const query = input.value.trim().toLowerCase();
+            const raw = input.value.trim();
+            const query = raw.toLowerCase();
+            const isIdSearch = query.startsWith("id:");
+            const idTerm = isIdSearch ? query.slice(3).trim() : "";
+
             document.querySelectorAll(".doc-entry").forEach(entry => {
+                const idHaystack = entry.dataset.id ?? "";
                 const haystack = entry.dataset.search ?? "";
-                const hide = query.length > 1 && !haystack.includes(query);
+                let hide = false;
+
+                if (!raw) {
+                    hide = false;
+                } else if (isIdSearch) {
+                    hide = idTerm.length > 0 && !idHaystack.includes(idTerm);
+                } else {
+                    hide = query.length > 1 && !haystack.includes(query);
+                }
+
                 entry.classList.toggle("search-hidden", hide);
             });
 
