@@ -30,6 +30,7 @@ async function main() {
 			server: 'server/src/server.ts'
 		},
 		bundle: true,
+		mainFields: ['module', 'main'],
 		format: 'cjs',
 		minify: production,
 		sourcemap: !production,

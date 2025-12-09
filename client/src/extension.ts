@@ -21,7 +21,11 @@ export function activate(context: vscode.ExtensionContext) {
 
     const serverOptions: ServerOptions = {
         run: { module: serverModule, transport: TransportKind.ipc },
-        debug: { module: serverModule, transport: TransportKind.ipc, options: {execArgv: ["--nolazy", "--inspect=6009"]}}
+        debug: {
+            module: serverModule,
+            transport: TransportKind.ipc,
+            options: { execArgv: ["--nolazy", "--inspect=0"] }
+        }
     };
 
     // Settings sent to the server (like where the documentation lives)
