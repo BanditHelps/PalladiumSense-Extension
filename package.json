@@ -10,7 +10,12 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onCommand:palladiumsense.newPower",
+    "onCommand:palladiumsense.viewDocumentation",
+    "onCommand:palladiumsense.initializeAddon",
+    "onCommand:palladiumsense.packageAddon",
+    "onLanguage:json"
   ],
   "main": "./dist/extension.js",
   "contributes": {
