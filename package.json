@@ -22,6 +22,10 @@
       {
         "command": "palladiumsense.viewDocumentation",
         "title": "View Palladium Documentation"
+      },
+      {
+        "command": "palladiumsense.initializeAddon",
+        "title": "Initialize New Addon"
       }
     ]
   },

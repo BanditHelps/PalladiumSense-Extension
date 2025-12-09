@@ -17,6 +17,7 @@ export function activate(context: vscode.ExtensionContext) {
 	// Register the "Power" command
     context.subscriptions.push(registerNewPowerCommand());
     context.subscriptions.push(registerDocumentationViewerCommand());
+    context.subscriptions.push(registerInitializeAddonCommand());
 
     const serverModule = context.asAbsolutePath("dist/server.js");
 
@@ -144,6 +145,195 @@ function registerNewPowerCommand(): vscode.Disposable {
     });
 }
 
+function registerInitializeAddonCommand(): vscode.Disposable {
+    return vscode.commands.registerCommand("palladiumsense.initializeAddon", async () => {
+        const workspaceFolder = await pickWorkspaceFolder();
+        if (!workspaceFolder) {
+            vscode.window.showErrorMessage("Open your Minecraft instance as a workspace folder before initializing an addon.");
+            return;
+        }
+
+        const displayName = await vscode.window.showInputBox({
+            title: "Addon Display Name",
+            prompt: "Enter the display name for the new addon",
+            placeHolder: "Example Addon",
+            validateInput: value => value && value.trim().length > 0 ? undefined : "Display name cannot be empty"
+        });
+
+        if (!displayName) {
+            return;
+        }
+
+        const modId = await vscode.window.showInputBox({
+            title: "Addon Mod ID",
+            prompt: "Enter the mod ID (lowercase, letters, numbers, underscores)",
+            placeHolder: "examplemod",
+            validateInput: value => /^[a-z0-9_]+$/.test(value.trim())
+                ? undefined
+                : "Mod ID must be lowercase letters, numbers, or underscores"
+        });
+
+        if (!modId) {
+            return;
+        }
+
+        const description = await vscode.window.showInputBox({
+            title: "Description",
+            prompt: "Describe what your addon will do",
+            placeHolder: "An Example Addon for Palladium!",
+            validateInput: value => value && value.trim().length > 0 ? undefined : "Description cannot be empty"
+        });
+
+        if (!description) {
+            return;
+        }
+
+        const author = await vscode.window.showInputBox({
+            title: "Author",
+            prompt: "Enter the Author of the addon",
+            placeHolder: "Notch",
+            validateInput: value => value && value.trim().length > 0 ? undefined : "Author cannot be empty"
+        });
+
+        if (!author) {
+            return;
+        }
+
+        const workspaceUri = workspaceFolder.uri;
+        const addonpacksUri = vscode.Uri.joinPath(workspaceUri, "addonpacks");
+
+        try {
+            await vscode.workspace.fs.createDirectory(addonpacksUri);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Failed to access addonpacks folder: ${message}`);
+            return;
+        }
+
+        const folderName = buildAddonFolderName(displayName, modId);
+
+        const addonRoot = vscode.Uri.joinPath(addonpacksUri, folderName);
+
+        if (await fileExists(addonRoot)) {
+            vscode.window.showErrorMessage(`An addon named "${folderName}" already exists in addonpacks.`);
+            return;
+        }
+
+        const createPath = (...segments: string[]): vscode.Uri => {
+            return segments.reduce((uri, segment) => vscode.Uri.joinPath(uri, segment), addonRoot);
+        };
+
+        const safeDisplayNameToml = displayName.replace(/"/g, '\\"');
+
+        const requiredDirectories: string[][] = [
+            ["addon", modId, "kubejs_scripts"],
+            ["data", modId, "kubejs_scripts"],
+            ["data", modId, "palladium", "powers"],
+            ["assets", modId, "kubejs_scripts"],
+            ["assets", modId, "lang"],
+            ["assets", modId, "palladium", "dynamic_textures"],
+            ["assets", modId, "palladium", "model_layers"],
+            ["assets", modId, "palladium", "render_layers"],
+            ["assets", modId, "palladium", "trails"],
+            ["assets", modId, "particles"],
+            ["assets", modId, "textures", "models"],
+            ["assets", modId, "textures", "icons"],
+            ["META-INF"]
+        ];
+
+        const filePayloads: { segments: string[]; contents: string }[] = [
+            {
+                segments: ["data", modId, "tracked_scores.json"],
+                contents: JSON.stringify({
+                    objectives: []
+                }, null, 4) + "\n"
+            },
+            {
+                segments: ["assets", modId, "lang", "en_us.json"],
+                contents: JSON.stringify({
+                    [`pack.${modId}.name`]: displayName
+                }, null, 4) + "\n"
+            },
+            {
+                segments: ["META-INF", "mods.toml"],
+                contents:
+`modLoader="lowcodefml"
+"showAsResourcePack = false
+loaderVersion="[47,)"
+license="All Rights Reserved"
+
+[[mods]]
+modId="${modId}"
+version="1.0.0"
+displayName="${safeDisplayNameToml}"
+description='''
+${description}
+'''
+
+[[dependencies.${modId}]]
+modId = "palladium"
+mandatory = true
+versionRange = ">=4.2.1"
+ordering = "NONE"
+side = "BOTH"
+`
+            },
+            {
+                segments: ["fabric.mod.json"],
+                contents: JSON.stringify({
+                    schemaVersion: 1,
+                    authors: author,
+                    id: modId,
+                    version: "1.0.0",
+                    name: displayName,
+                    description: description,
+                    icon: "logo.png",
+                    license: "All rights reserved"
+                }, null, 4) + "\n"
+            },
+            {
+                segments: ["pack.mcmeta"],
+                contents: JSON.stringify({
+                    pack: {
+                        id: modId,
+                        pack_format: 15,
+                        description: description,
+                        version: "1.0.0"
+                    },
+                    dependencies: {
+                        common: {},
+                        fabric: {},
+                        forge: {},
+                    }
+                }, null, 4) + "\n"
+            }
+        ];
+
+        try {
+            await vscode.workspace.fs.createDirectory(addonRoot);
+            for (const segments of requiredDirectories) {
+                await vscode.workspace.fs.createDirectory(createPath(...segments));
+            }
+            for (const { segments, contents } of filePayloads) {
+                await vscode.workspace.fs.writeFile(createPath(...segments), Buffer.from(contents, "utf8"));
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(`Failed to scaffold addon: ${message}`);
+            return;
+        }
+
+        try {
+            await initializeGitRepository(addonRoot);
+            vscode.window.showInformationMessage(`Initialized addon "${displayName}" in ${vscode.workspace.asRelativePath(addonRoot)} and set up Git.`);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            vscode.window.showWarningMessage(`Addon created, but Git initialization failed: ${message}`);
+            vscode.window.showInformationMessage(`Initialized addon "${displayName}" in ${vscode.workspace.asRelativePath(addonRoot)}.`);
+        }
+    });
+}
+
 function registerDocumentationViewerCommand(): vscode.Disposable {
     return vscode.commands.registerCommand("palladiumsense.viewDocumentation", async () => {
         const workspaceFolder = await pickWorkspaceFolder();
@@ -237,6 +427,14 @@ type DocEntry = {
     example?: string;
 };
 
+type GitAPI = {
+    init(root: vscode.Uri): Promise<unknown>;
+};
+
+type GitExtensionExports = {
+    getAPI(version: number): GitAPI;
+};
+
 async function pickWorkspaceFolder(): Promise<vscode.WorkspaceFolder | undefined> {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) {
@@ -266,6 +464,20 @@ function slugify(name: string): string {
     const trimmed = name.trim().toLowerCase();
     const sanitized = trimmed.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     return sanitized.length > 0 ? sanitized : "power";
+}
+
+function buildAddonFolderName(displayName: string, fallback: string): string {
+    const parts = displayName
+        .split(/[^a-zA-Z0-9]+/)
+        .filter(Boolean)
+        .map(part => part.charAt(0).toUpperCase() + part.slice(1));
+
+    if (parts.length) {
+        return parts.join("");
+    }
+
+    const sanitizedFallback = fallback.replace(/[^a-zA-Z0-9]+/g, "");
+    return sanitizedFallback || "AddonPack";
 }
 
 type PowerDirPickItem = vscode.QuickPickItem & { target: vscode.Uri };
@@ -335,7 +547,8 @@ function buildPowerTemplate(name: string, guiDisplayType: string): string {
     "gui_display_type": "${guiDisplayType}",
     "abilities": {
 
-    }`;
+    }
+}`;
 }
 
 async function loadDocumentationSections(docsRoot: vscode.Uri): Promise<DocSection[]> {
@@ -404,6 +617,28 @@ function formatDocTitle(fileName: string): string {
     return parts
         .map(part => part.charAt(0).toUpperCase() + part.slice(1))
         .join(" ");
+}
+
+async function initializeGitRepository(target: vscode.Uri): Promise<void> {
+    const gitExtension = vscode.extensions.getExtension("vscode.git");
+    if (!gitExtension) {
+        throw new Error("VS Code Git extension not available.");
+    }
+
+    const extensionExports: GitExtensionExports | undefined = gitExtension.isActive
+        ? gitExtension.exports
+        : await gitExtension.activate();
+
+    if (!extensionExports || typeof extensionExports.getAPI !== "function") {
+        throw new Error("Git extension API unavailable.");
+    }
+
+    const api = extensionExports.getAPI(1);
+    if (!api || typeof api.init !== "function") {
+        throw new Error("Git init API is unavailable.");
+    }
+
+    await api.init(target);
 }
 
 async function parseDocumentationFile(fileUri: vscode.Uri, title: string): Promise<DocSection | null> {
