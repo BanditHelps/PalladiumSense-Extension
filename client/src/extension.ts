@@ -311,6 +311,10 @@ side = "BOTH"
                         forge: {},
                     }
                 }, null, 4) + "\n"
+            },
+            {
+                segments: [".palladiumignore"],
+                contents: ".github\n.palladiumignore"
             }
         ];
 
@@ -380,7 +384,8 @@ function registerPackageAddonCommand(): vscode.Disposable {
         const jarUri = vscode.Uri.joinPath(packagedRoot, `${modId}-${timestamp}.jar`);
 
         try {
-            const archive = await createAddonArchive(selection.root);
+            const ignoreRules = await loadPackagingIgnoreRules(selection.root);
+            const archive = await createAddonArchive(selection.root, ignoreRules);
             await vscode.workspace.fs.writeFile(jarUri, archive);
             vscode.window.showInformationMessage(`Packaged addon "${selection.label}" to ${vscode.workspace.asRelativePath(jarUri)}.`);
         } catch (error) {
@@ -543,9 +548,65 @@ function formatTimestampForFile(date: Date): string {
     return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
-async function createAddonArchive(root: vscode.Uri): Promise<Uint8Array> {
+async function loadPackagingIgnoreRules(root: vscode.Uri): Promise<IgnoreRule[]> {
+    const defaults: IgnoreRule[] = [
+        ".git",
+        ".git/**",
+        ".DS_Store",
+        "Thumbs.db",
+        "packaged_addons",
+        "packaged_addons/**"
+    ];
+
+    const ignoreFile = vscode.Uri.joinPath(root, ".palladiumignore");
+
+    try {
+        const raw = await vscode.workspace.fs.readFile(ignoreFile);
+        const text = raw.toString();
+        const fromFile = text
+            .split(/\r?\n/)
+            .map(line => line.trim())
+            .filter(line => line.length > 0 && !line.startsWith("#"));
+        return defaults.concat(fromFile);
+    } catch {
+        return defaults;
+    }
+}
+
+function normalizeIgnoreRules(rules: IgnoreRule[]): IgnoreRule[] {
+    return rules.map(rule => rule.replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+$/, ""));
+}
+
+function shouldExclude(relPath: string, rules: IgnoreRule[]): boolean {
+    const normalized = relPath.replace(/\\/g, "/");
+    for (const rule of rules) {
+        if (!rule) {
+            continue;
+        }
+        if (normalized === rule) {
+            return true;
+        }
+        if (rule.endsWith("/**")) {
+            const prefix = rule.slice(0, -3);
+            if (normalized === prefix || normalized.startsWith(`${prefix}/`)) {
+                return true;
+            }
+        } else if (rule.endsWith("/*")) {
+            const prefix = rule.slice(0, -2);
+            if (normalized.startsWith(`${prefix}/`)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+type IgnoreRule = string;
+
+async function createAddonArchive(root: vscode.Uri, ignoreRules: IgnoreRule[]): Promise<Uint8Array> {
     const zip = new JSZip();
-    await addFolderToZip(zip, root, "");
+    const normalizedRules = normalizeIgnoreRules(ignoreRules);
+    await addFolderToZip(zip, root, "", normalizedRules);
     return zip.generateAsync({
         type: "uint8array",
         compression: "DEFLATE",
@@ -553,20 +614,20 @@ async function createAddonArchive(root: vscode.Uri): Promise<Uint8Array> {
     });
 }
 
-async function addFolderToZip(zip: JSZip, folderUri: vscode.Uri, relativePath: string): Promise<void> {
+async function addFolderToZip(zip: JSZip, folderUri: vscode.Uri, relativePath: string, ignoreRules: IgnoreRule[]): Promise<void> {
     const entries = await vscode.workspace.fs.readDirectory(folderUri);
     for (const [name, type] of entries) {
-        if (name === ".git") {
-            continue;
-        }
-
         const childUri = vscode.Uri.joinPath(folderUri, name);
         const relPath = relativePath ? `${relativePath}/${name}` : name;
         const normalizedPath = relPath.replace(/\\/g, "/");
 
+        if (shouldExclude(normalizedPath, ignoreRules)) {
+            continue;
+        }
+
         if ((type & vscode.FileType.Directory) !== 0) {
             zip.folder(normalizedPath);
-            await addFolderToZip(zip, childUri, normalizedPath);
+            await addFolderToZip(zip, childUri, normalizedPath, ignoreRules);
             continue;
         }
 
@@ -581,7 +642,7 @@ async function addFolderToZip(zip: JSZip, folderUri: vscode.Uri, relativePath: s
                 const stat = await vscode.workspace.fs.stat(childUri);
                 if ((stat.type & vscode.FileType.Directory) !== 0) {
                     zip.folder(normalizedPath);
-                    await addFolderToZip(zip, childUri, normalizedPath);
+                    await addFolderToZip(zip, childUri, normalizedPath, ignoreRules);
                 } else if ((stat.type & vscode.FileType.File) !== 0) {
                     const contents = await vscode.workspace.fs.readFile(childUri);
                     zip.file(normalizedPath, contents);
