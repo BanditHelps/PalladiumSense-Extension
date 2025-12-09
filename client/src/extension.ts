@@ -164,6 +164,13 @@ function registerDocumentationViewerCommand(): vscode.Disposable {
             return;
         }
 
+        const entryIndex = new Map<string, { section: string; example?: string }>();
+        sections.forEach(section => {
+            section.entries.forEach(entry => {
+                entryIndex.set(entry.id, { section: section.title, example: entry.example });
+            });
+        });
+
         const panel = vscode.window.createWebviewPanel(
             "palladiumDocumentation",
             "Palladium Documentation",
@@ -175,6 +182,44 @@ function registerDocumentationViewerCommand(): vscode.Disposable {
         );
 
         panel.webview.html = buildDocumentationWebviewContent(panel.webview, sections);
+
+        panel.webview.onDidReceiveMessage(async message => {
+            if (!message || typeof message !== "object") {
+                return;
+            }
+
+            if (message.type !== "insertEntry" && message.type !== "copyEntry") {
+                return;
+            }
+
+            const entryId: string | undefined = message.entryId;
+            const payload = entryId ? entryIndex.get(entryId) : undefined;
+            const sectionTitle: string | undefined = message.section ?? payload?.section;
+            const normalized = normalizeEntryJson(
+                typeof message.example === "string" ? message.example : payload?.example,
+                sectionTitle
+            );
+
+            if (!normalized) {
+                vscode.window.showWarningMessage("Unable to use this documentation entry – no example data was found.");
+                return;
+            }
+
+            if (message.type === "copyEntry") {
+                await vscode.env.clipboard.writeText(normalized);
+                vscode.window.showInformationMessage("Copied documentation snippet to clipboard.");
+                return;
+            }
+
+            const editor = vscode.window.activeTextEditor;
+            if (editor) {
+                const snippet = new vscode.SnippetString(normalized);
+                await editor.insertSnippet(snippet, editor.selections);
+            } else {
+                await vscode.env.clipboard.writeText(normalized);
+                vscode.window.showWarningMessage("No active editor detected. Snippet copied to clipboard instead.");
+            }
+        });
     });
 }
 
@@ -189,6 +234,7 @@ type DocEntry = {
     description?: string;
     html: string;
     searchText: string;
+    example?: string;
 };
 
 async function pickWorkspaceFolder(): Promise<vscode.WorkspaceFolder | undefined> {
@@ -319,7 +365,7 @@ async function parseDocumentationFile(fileUri: vscode.Uri, title: string): Promi
     try {
         const raw = await vscode.workspace.fs.readFile(fileUri);
         const contents = raw.toString();
-        const entries = extractDocumentationEntries(contents);
+        const entries = extractDocumentationEntries(contents, title);
         return entries.length ? { title, entries } : null;
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -328,7 +374,7 @@ async function parseDocumentationFile(fileUri: vscode.Uri, title: string): Promi
     }
 }
 
-function extractDocumentationEntries(html: string): DocEntry[] {
+function extractDocumentationEntries(html: string, sectionTitle: string): DocEntry[] {
     const $ = cheerio.load(html);
     const result: DocEntry[] = [];
 
@@ -366,6 +412,8 @@ function extractDocumentationEntries(html: string): DocEntry[] {
 
         const descriptionNode = block.find("p").first();
         const description = descriptionNode.text().trim();
+        const exampleNode = block.find("pre").first();
+        const example = exampleNode.text().trim() || undefined;
 
         titleNode.remove();
         if (description && descriptionNode.length) {
@@ -382,6 +430,7 @@ function extractDocumentationEntries(html: string): DocEntry[] {
             description,
             html: htmlContent,
             searchText,
+            example,
         });
     });
 
@@ -396,7 +445,8 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
             title: entry.title,
             description: entry.description,
             html: entry.html,
-            searchText: entry.searchText
+            searchText: entry.searchText,
+            example: entry.example
         }))
     }));
 
@@ -458,12 +508,15 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
         #tab-bar {
             display: flex;
             gap: 8px;
-            padding: 0 24px 12px 24px;
+            padding: 12px 24px;
             border-bottom: 1px solid var(--border);
             background: var(--bg);
             position: sticky;
             top: 72px;
             z-index: 9;
+            justify-content: flex-start;
+            align-items: center;
+            flex-wrap: wrap;
         }
 
         .tab-button {
@@ -568,8 +621,13 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
         .doc-entry table {
             width: 100%;
             border-collapse: collapse;
-            margin: 12px 0 16px 0;
+            margin: 12px 0 18px 0;
             font-size: 0.9rem;
+        }
+
+        .doc-entry-body h3,
+        .doc-entry-body h4 {
+            margin: 18px 0 8px 0;
         }
 
         .doc-entry th,
@@ -600,6 +658,38 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
         .hidden {
             display: none !important;
         }
+
+        #context-menu {
+            position: fixed;
+            z-index: 20;
+            min-width: 180px;
+            background: var(--panel-alt);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 8px;
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.35);
+            padding: 4px 0;
+            display: none;
+        }
+
+        #context-menu.visible {
+            display: block;
+        }
+
+        #context-menu button {
+            display: block;
+            width: 100%;
+            padding: 8px 16px;
+            background: transparent;
+            border: none;
+            color: inherit;
+            text-align: left;
+            font-size: 0.95rem;
+            cursor: pointer;
+        }
+
+        #context-menu button:hover {
+            background: rgba(255, 255, 255, 0.07);
+        }
     </style>
 </head>
 <body>
@@ -609,18 +699,30 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
     </header>
     <nav id="tab-bar"></nav>
     <main id="docs"></main>
+    <div id="context-menu">
+        <button data-action="insert">Insert into Editor</button>
+        <button data-action="copy">Copy JSON</button>
+    </div>
     <script nonce="${nonce}">
         const data = ${data};
         const tabs = document.getElementById("tab-bar");
         const container = document.getElementById("docs");
         const input = document.getElementById("search");
+        const menu = document.getElementById("context-menu");
         let activeTab = data[0]?.title ?? "";
+        let menuTarget = null;
 
-        const createEntry = (entry) => {
+        const vscode = acquireVsCodeApi();
+
+        const createEntry = (entry, sectionTitle) => {
             const article = document.createElement("article");
             article.className = "doc-entry";
             article.dataset.search = entry.searchText;
             article.id = entry.id.replace(/[^\\w-]+/g, "_");
+            article.dataset.section = sectionTitle;
+            if (entry.example) {
+                article.dataset.example = entry.example;
+            }
 
             const header = document.createElement("header");
             const title = document.createElement("h3");
@@ -662,7 +764,7 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
                 const entriesWrapper = document.createElement("div");
                 entriesWrapper.className = "doc-entries";
                 section.entries.forEach(entry => {
-                    entriesWrapper.appendChild(createEntry(entry));
+                    entriesWrapper.appendChild(createEntry(entry, section.title));
                 });
 
                 const placeholder = document.createElement("p");
@@ -690,6 +792,7 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
 
         const setActiveTab = (title) => {
             activeTab = title;
+            hideMenu();
             document.querySelectorAll(".tab-button").forEach(btn => {
                 btn.classList.toggle("active", btn.dataset.section === title);
             });
@@ -720,7 +823,60 @@ function buildDocumentationWebviewContent(webview: vscode.Webview, sections: Doc
         setActiveTab(activeTab);
         applySearch();
 
-        input.addEventListener("input", () => applySearch());
+        const hideMenu = () => {
+            menu.classList.remove("visible");
+            menuTarget = null;
+        };
+
+        container.addEventListener("contextmenu", event => {
+            const entry = event.target.closest(".doc-entry");
+            if (!entry) {
+                hideMenu();
+                return;
+            }
+            event.preventDefault();
+            menuTarget = entry;
+            menu.style.top = event.clientY + "px";
+            menu.style.left = event.clientX + "px";
+            menu.classList.add("visible");
+        });
+
+        document.addEventListener("click", event => {
+            if (!menu.contains(event.target)) {
+                hideMenu();
+            }
+        });
+
+        window.addEventListener("blur", hideMenu);
+
+        menu.addEventListener("click", event => {
+            const button = event.target.closest("button[data-action]");
+            if (!button || !menuTarget) {
+                return;
+            }
+
+            const action = button.dataset.action;
+            const example = menuTarget.dataset.example;
+            const section = menuTarget.dataset.section;
+            if (!example) {
+                hideMenu();
+                return;
+            }
+
+            vscode.postMessage({
+                type: action === "insert" ? "insertEntry" : "copyEntry",
+                entryId: menuTarget.id,
+                example,
+                section
+            });
+
+            hideMenu();
+        });
+
+        input.addEventListener("input", () => {
+            hideMenu();
+            applySearch();
+        });
     </script>
 </body>
 </html>`;
@@ -741,5 +897,43 @@ function tryFormatJsonSnippet(raw: string): string | null {
         return JSON.stringify(parsed, null, 4);
     } catch {
         return null;
+    }
+}
+
+function normalizeEntryJson(example: string | undefined, sectionTitle?: string): string | undefined {
+    if (!example) {
+        return undefined;
+    }
+
+    try {
+        const parsed = JSON.parse(example);
+        if (sectionTitle && sectionTitle.toLowerCase().includes("abilit")) {
+            ensureConditionsBlock(parsed);
+        }
+        return JSON.stringify(parsed, null, 4);
+    } catch {
+        return example;
+    }
+}
+
+function ensureConditionsBlock(value: unknown): void {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return;
+    }
+
+    const obj = value as Record<string, unknown>;
+    const existing = obj["conditions"];
+
+    if (!existing || typeof existing !== "object" || Array.isArray(existing)) {
+        obj["conditions"] = { enabling: [], unlocking: [] };
+        return;
+    }
+
+    const target = existing as Record<string, unknown>;
+    if (!Array.isArray(target["enabling"])) {
+        target["enabling"] = [];
+    }
+    if (!Array.isArray(target["unlocking"])) {
+        target["unlocking"] = [];
     }
 }
