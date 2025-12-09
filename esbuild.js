@@ -36,7 +36,7 @@ async function main() {
 		sourcesContent: false,
 		platform: 'node',
 		outdir: 'dist',
-		external: ['vscode'],
+		external: ['vscode', 'cheerio', 'encoding', 'iconv-lite'],
 		logLevel: 'silent',
 		plugins: [
 			/* add to the end of plugins array */
