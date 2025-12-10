@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as os from 'os';
 import * as cheerio from 'cheerio';
 import JSZip = require('jszip');
 
@@ -12,7 +13,7 @@ import {
 
 let client: LanguageClient;
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
 	console.log('Palladium Sense is active!');
 
 	// Register the "Power" command
@@ -33,10 +34,9 @@ export function activate(context: vscode.ExtensionContext) {
     };
 
     // Settings sent to the server (like where the documentation lives)
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const docsRoot = workspaceRoot
-        ? path.join(workspaceRoot, "mods", "documentation", "palladium")
-        : undefined;
+    const primaryWorkspace = vscode.workspace.workspaceFolders?.[0];
+    const docsResolution = await resolveDocumentationRoot(primaryWorkspace);
+    const docsRoot = docsResolution.uri?.fsPath;
 
     const clientOptions: LanguageClientOptions = {
         documentSelector: [{ scheme: "file", language: "json" }],
@@ -398,20 +398,29 @@ function registerPackageAddonCommand(): vscode.Disposable {
 function registerDocumentationViewerCommand(): vscode.Disposable {
     return vscode.commands.registerCommand("palladiumsense.viewDocumentation", async () => {
         const workspaceFolder = await pickWorkspaceFolder();
-        if (!workspaceFolder) {
-            vscode.window.showErrorMessage("Open your Minecraft instance as a workspace folder before viewing documentation.");
-            return;
-        }
+        const docsResolution = await resolveDocumentationRoot(workspaceFolder);
+        const docsRoot = docsResolution.uri;
 
-        const docsRoot = vscode.Uri.joinPath(workspaceFolder.uri, "mods", "documentation", "palladium");
-        if (!(await directoryExists(docsRoot))) {
-            vscode.window.showErrorMessage("Could not find mods/documentation/palladium under the selected workspace.");
+        if (!docsRoot) {
+            const attempts: string[] = [];
+            if (docsResolution.workspacePath) {
+                attempts.push(docsResolution.workspacePath.fsPath);
+            }
+            if (docsResolution.configuredPath) {
+                attempts.push(docsResolution.configuredPath);
+            }
+
+            const suffix = attempts.length
+                ? ` Checked: ${attempts.join(" | ")}`
+                : " Configure a documentation path in settings or open a workspace that contains mods/documentation/palladium.";
+
+            vscode.window.showErrorMessage(`Could not find a Palladium documentation folder.${suffix}`);
             return;
         }
 
         const sections = await loadDocumentationSections(docsRoot);
         if (!sections.length) {
-            vscode.window.showWarningMessage("No documentation files were found in mods/documentation/palladium.");
+            vscode.window.showWarningMessage(`No documentation files were found in ${docsRoot.fsPath}.`);
             return;
         }
 
@@ -498,6 +507,13 @@ type GitExtensionExports = {
     getAPI(version: number): GitAPI;
 };
 
+type DocumentationResolution = {
+    uri?: vscode.Uri;
+    source: "workspace" | "setting" | "none";
+    workspacePath?: vscode.Uri;
+    configuredPath?: string;
+};
+
 async function pickWorkspaceFolder(): Promise<vscode.WorkspaceFolder | undefined> {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) {
@@ -527,6 +543,50 @@ function slugify(name: string): string {
     const trimmed = name.trim().toLowerCase();
     const sanitized = trimmed.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     return sanitized.length > 0 ? sanitized : "power";
+}
+
+async function resolveDocumentationRoot(workspaceFolder?: vscode.WorkspaceFolder | null): Promise<DocumentationResolution> {
+    const workspacePath = workspaceFolder
+        ? vscode.Uri.joinPath(workspaceFolder.uri, "mods", "documentation", "palladium")
+        : undefined;
+
+    if (workspacePath && await directoryExists(workspacePath)) {
+        return { uri: workspacePath, source: "workspace", workspacePath };
+    }
+
+    const configuredPath = getConfiguredDocumentationPath(workspaceFolder);
+    if (configuredPath) {
+        const candidate = vscode.Uri.file(configuredPath);
+        if (await directoryExists(candidate)) {
+            return { uri: candidate, source: "setting", workspacePath, configuredPath };
+        }
+        return { uri: undefined, source: "none", workspacePath, configuredPath };
+    }
+
+    return { uri: undefined, source: "none", workspacePath };
+}
+
+function getConfiguredDocumentationPath(workspaceFolder?: vscode.WorkspaceFolder | null): string | undefined {
+    const rawPath = vscode.workspace.getConfiguration("palladiumsense").get<string>("documentationPath");
+    if (!rawPath) {
+        return undefined;
+    }
+
+    const trimmed = rawPath.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+
+    const expanded = trimmed.startsWith("~")
+        ? path.join(os.homedir(), trimmed.slice(1))
+        : trimmed;
+
+    if (path.isAbsolute(expanded)) {
+        return path.normalize(expanded);
+    }
+
+    const base = workspaceFolder?.uri.fsPath;
+    return path.normalize(base ? path.join(base, expanded) : path.resolve(expanded));
 }
 
 function buildAddonFolderName(displayName: string, fallback: string): string {

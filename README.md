@@ -24,7 +24,8 @@ code --install-extension palladiumsense-0.0.1.vsix
 - Renders all `mods/documentation/palladium/*.html` files as tabs (Abilities, Conditions first, others alphabetically).
 - Search across entries; right-click entries to insert example JSON into the editor or copy to clipboard.
 - Formatting helpers normalize examples (adds missing `conditions` block for abilities when needed).
+- If your workspace does not contain the documentation, set `palladiumsense.documentationPath` to point at the folder instead.
 
 ## Notes
-- The viewer and commands expect your workspace root to be the Minecraft instance containing `addonpacks/` and `mods/documentation/palladium/`.
+- By default the extension looks under `mods/documentation/palladium/` in the current workspace; configure `palladiumsense.documentationPath` when the files live elsewhere.
 - Packaging honors `.palladiumignore` at the addon root for custom excludes.

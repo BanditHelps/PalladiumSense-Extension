@@ -6,6 +6,7 @@
   "engines": {
     "vscode": "^1.106.1"
   },
+  "publisher": "bandithelps",
   "categories": [
     "Other"
   ],
@@ -36,7 +37,18 @@
         "command": "palladiumsense.packageAddon",
         "title": "Package Addon"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "PalladiumSense",
+      "properties": {
+        "palladiumsense.documentationPath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Path to your Palladium documentation folder (with abilities.html and conditions.html). Used when mods/documentation/palladium cannot be found in the workspace."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
