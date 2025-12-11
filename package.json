@@ -2,7 +2,7 @@
   "name": "palladiumsense",
   "displayName": "PalladiumSense",
   "description": "An extension that give snippets and tools for Palladium Minecraft addon creation",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "engines": {
     "vscode": "^1.106.1"
   },
