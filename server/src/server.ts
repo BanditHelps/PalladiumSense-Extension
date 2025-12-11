@@ -105,7 +105,10 @@ connection.onInitialize(async (params: InitializeParams) => {
     return {
         capabilities: {
             textDocumentSync: TextDocumentSyncKind.Incremental,
-            completionProvider: { resolveProvider: true },
+            completionProvider: {
+                resolveProvider: true,
+                triggerCharacters: ['"', ':', ' ', ',', '[']
+            },
             hoverProvider: true
         }
     };
@@ -149,16 +152,22 @@ connection.onCompletion(
             return buildAbilityFieldCompletions(fieldContext);
         }
 
-        const ctx = resolveCompletionContext(doc, params.position);
+        const ctx = resolveSnippetCompletionContext(doc, params.position);
         if (ctx === "condition") {
             const needsComma = shouldAddTrailingComma(doc, params.position);
             return conditions.map(c => ({
                 label: c.name,
                 kind: CompletionItemKind.Snippet,
                 detail: c.id,
+                filterText: `${c.name} ${c.id}`,
+                sortText: c.name.toLowerCase(),
                 documentation: buildDocumentationSummary(c),
                 insertTextFormat: InsertTextFormat.Snippet,
-                insertText: needsComma ? `${c.snippet},` : c.snippet,
+                insertText: applyIndentationToSnippet(
+                    needsComma ? `${c.snippet},` : c.snippet,
+                    doc,
+                    params.position
+                ),
             }));
         }
 
@@ -168,9 +177,15 @@ connection.onCompletion(
                 label: a.name,
                 kind: CompletionItemKind.Snippet,
                 detail: a.id,
+                filterText: `${a.name} ${a.id}`,
+                sortText: a.name.toLowerCase(),
                 documentation: buildDocumentationSummary(a),
                 insertTextFormat: InsertTextFormat.Snippet,
-                insertText: needsComma ? `${a.snippet},` : a.snippet,
+                insertText: applyIndentationToSnippet(
+                    needsComma ? `${a.snippet},` : a.snippet,
+                    doc,
+                    params.position
+                ),
             }));
         }
 
@@ -315,21 +330,322 @@ function resolveHoverContext(document: TextDocument, position: Position): HoverC
     return undefined;
 }
 
-function resolveCompletionContext(document: TextDocument, position: Position): DocKind | undefined {
+function resolveSnippetCompletionContext(document: TextDocument, position: Position): DocKind | undefined {
     const text = document.getText();
     const offset = document.offsetAt(position);
+    const tree = parseTree(text);
     const location = getLocation(text, offset);
-    const path = location.path;
 
-    if (isConditionPath(path)) {
-        return "condition";
+    if (!tree) {
+        return undefined;
     }
 
-    if (isAbilityPath(path)) {
+    const node = findNodeAtOffset(tree, offset, true) ?? location.previousNode;
+    const propertyNode = getPropertyNode(node);
+
+    // Do not trigger while typing the key itself
+    if (propertyNode?.children?.length) {
+        const [keyNode] = propertyNode.children;
+        if (keyNode?.type === "string" && isOffsetInsideNode(offset, keyNode)) {
+            return undefined;
+        }
+    }
+
+    const objectNode = getEnclosingObject(node);
+    if (objectNode && isAbilityEntryObjectContext(objectNode)) {
         return "ability";
     }
 
+    if (objectNode && isConditionEntryObjectContext(objectNode)) {
+        return "condition";
+    }
+
+    const conditionArrayKind = isConditionArrayContext(node);
+    if (conditionArrayKind) {
+        return conditionArrayKind;
+    }
+
+    // Fallback to path-based detection when the value object hasn't been typed yet
+    const docKindFromPath = resolveKindFromPath(location.path);
+    return docKindFromPath ?? undefined;
+}
+
+function isOffsetInsideNode(offset: number, node: JsonNode): boolean {
+    const start = node.offset;
+    const end = node.offset + (node.length ?? 0);
+    return offset >= start && offset <= end;
+}
+
+function findEnclosingArrayNode(document: TextDocument, position: Position): JsonNode | undefined {
+    const text = document.getText();
+    const tree = parseTree(text);
+    if (!tree) { return undefined; }
+
+    const offset = document.offsetAt(position);
+    let node = findNodeAtOffset(tree, offset, true);
+    while (node && node.type !== "array") {
+        node = node.parent;
+    }
+    return node;
+}
+
+function applyIndentationToSnippet(snippet: string, document: TextDocument, position: Position): string {
+    const arrayNode = findEnclosingArrayNode(document, position);
+    if (!arrayNode || isConditionArrayContext(arrayNode) !== "condition") {
+        return snippet;
+    }
+
+    const text = document.getText();
+    const offset = document.offsetAt(position);
+
+    const arrayStartLine = document.positionAt(arrayNode.offset).line;
+    const arrayIndent = getLineIndent(text, arrayStartLine, document);
+    const indentUnit = determineIndentUnit(text);
+    const itemIndent = `${arrayIndent}${indentUnit}`;
+
+    const prevCharIdx = findPreviousNonWhitespaceIndex(text, offset - 1);
+    const prevChar = prevCharIdx !== undefined ? text.charAt(prevCharIdx) : undefined;
+    const prevCharLine = prevCharIdx !== undefined ? document.positionAt(prevCharIdx).line : undefined;
+    const currentIndent = getLineIndent(text, position.line, document);
+
+    const normalizedSnippet = normalizeSnippetIndent(snippet);
+
+    const reindentFromBase = (baseIndent: string): string => {
+        const lines = normalizedSnippet.split("\n");
+        return lines.map(line => `${baseIndent}${line}`).join("\n");
+    };
+
+    // Case 1: cursor is right after "[" on the same line – break to new line and indent item.
+    if (prevChar === "[" && prevCharLine === arrayStartLine) {
+        const indentedSnippet = reindentFromBase(itemIndent);
+        const arrayClosingLine = document.positionAt(arrayNode.offset + (arrayNode.length ?? 0) - 1).line;
+        const needsClosingIndent = arrayClosingLine === arrayStartLine;
+        if (needsClosingIndent) {
+            return `\n${indentedSnippet}\n${arrayIndent}`;
+        }
+        return `\n${indentedSnippet}`;
+    }
+
+    // Case 3: cursor is after a "}" on the same line – start a new line aligned with previous item.
+    if (prevChar === "}" && prevCharLine === position.line) {
+        const previousIndent = getLineIndent(text, prevCharLine ?? position.line, document);
+        const indentedSnippet = reindentFromBase(previousIndent);
+        return `\n${indentedSnippet}`;
+    }
+
+    // Case 2 (default): rely on editor indentation; return normalized snippet unchanged.
+    return normalizedSnippet;
+}
+
+function getLineIndent(text: string, line: number, document: TextDocument): string {
+    if (line < 0) {
+        return "";
+    }
+
+    const lineStart = document.offsetAt({ line, character: 0 });
+    const nextLineStart =
+        line + 1 < document.lineCount ? document.offsetAt({ line: line + 1, character: 0 }) : text.length;
+
+    const lineText = text.slice(lineStart, nextLineStart);
+    const match = lineText.match(/^[ \t]*/);
+    return match ? match[0] : "";
+}
+
+function determineIndentUnit(text: string): string {
+    const lines = text.split(/\r?\n/);
+    let minSpaces: number | undefined;
+
+    for (const line of lines) {
+        const match = line.match(/^(\s+)\S/);
+        if (!match) {
+            continue;
+        }
+
+        const indent = match[1];
+        if (indent.includes("\t")) {
+            return "\t";
+        }
+
+        const spaceCount = indent.length;
+        if (!minSpaces || spaceCount < minSpaces) {
+            minSpaces = spaceCount;
+        }
+    }
+
+    return minSpaces ? " ".repeat(minSpaces) : "    ";
+}
+
+function findPreviousNonWhitespaceIndex(text: string, start: number): number | undefined {
+    for (let idx = start; idx >= 0; idx--) {
+        const char = text.charAt(idx);
+        if (char !== " " && char !== "\t" && char !== "\r" && char !== "\n") {
+            return idx;
+        }
+    }
+
     return undefined;
+}
+
+function normalizeSnippetIndent(snippet: string): string {
+    const lines = snippet.split("\n");
+    if (lines.length === 0) {
+        return snippet;
+    }
+
+    let minIndent: number | undefined;
+    for (const line of lines) {
+        if (!line.trim()) {
+            continue;
+        }
+        const leading = line.match(/^[ \t]*/)?.[0] ?? "";
+        const count = leading.replace(/[^\t ]/g, "").length;
+        if (minIndent === undefined || count < minIndent) {
+            minIndent = count;
+        }
+    }
+
+    if (!minIndent) {
+        return snippet;
+    }
+
+    return lines
+        .map(line => (line.length >= minIndent ? line.slice(minIndent) : line.trim() ? line.trimStart() : line))
+        .join("\n");
+}
+
+function isAbilityEntryObjectContext(objectNode: JsonNode): boolean {
+    if (objectNode.type !== "object") {
+        return false;
+    }
+
+    const abilityProperty = objectNode.parent;
+    if (!abilityProperty || abilityProperty.type !== "property" || abilityProperty.children?.length !== 2) {
+        return false;
+    }
+
+    const abilitiesContainer = abilityProperty.parent;
+    if (!abilitiesContainer || abilitiesContainer.type !== "object") {
+        return false;
+    }
+
+    const abilitiesProperty = abilitiesContainer.parent;
+    if (!abilitiesProperty || abilitiesProperty.type !== "property" || abilitiesProperty.children?.length !== 2) {
+        return false;
+    }
+
+    const [abilitiesKey] = abilitiesProperty.children;
+    return abilitiesKey?.type === "string" && abilitiesKey.value === "abilities";
+}
+
+function isConditionEntryObjectContext(objectNode: JsonNode): boolean {
+    if (objectNode.type !== "object") {
+        return false;
+    }
+
+    const arrayNode = objectNode.parent;
+    if (!arrayNode || arrayNode.type !== "array") {
+        return false;
+    }
+
+    const listProperty = arrayNode.parent;
+    if (!listProperty || listProperty.type !== "property" || listProperty.children?.length !== 2) {
+        return false;
+    }
+
+    const [listKey] = listProperty.children;
+    if (!listKey || listKey.type !== "string" || (listKey.value !== "enabling" && listKey.value !== "unlocking")) {
+        return false;
+    }
+
+    const conditionsObject = listProperty.parent;
+    if (!conditionsObject || conditionsObject.type !== "object") {
+        return false;
+    }
+
+    const conditionsProperty = conditionsObject.parent;
+    if (!conditionsProperty || conditionsProperty.type !== "property" || conditionsProperty.children?.length !== 2) {
+        return false;
+    }
+
+    const [conditionsKey] = conditionsProperty.children;
+    if (!conditionsKey || conditionsKey.type !== "string" || conditionsKey.value !== "conditions") {
+        return false;
+    }
+
+    const abilityValueObject = conditionsProperty.parent;
+    if (!abilityValueObject) {
+        return false;
+    }
+
+    return isAbilityEntryObjectContext(abilityValueObject);
+}
+
+function isConditionArrayContext(node: JsonNode | undefined): DocKind | undefined {
+    let current: JsonNode | undefined = node;
+    while (current && current.type !== "array") {
+        current = current.parent;
+    }
+
+    if (!current || current.type !== "array") {
+        return undefined;
+    }
+
+    const listProperty = current.parent;
+    if (!listProperty || listProperty.type !== "property" || listProperty.children?.length !== 2) {
+        return undefined;
+    }
+
+    const [listKey] = listProperty.children;
+    if (!listKey || listKey.type !== "string" || (listKey.value !== "enabling" && listKey.value !== "unlocking")) {
+        return undefined;
+    }
+
+    const conditionsObject = listProperty.parent;
+    if (!conditionsObject || conditionsObject.type !== "object") {
+        return undefined;
+    }
+
+    const conditionsProperty = conditionsObject.parent;
+    if (!conditionsProperty || conditionsProperty.type !== "property" || conditionsProperty.children?.length !== 2) {
+        return undefined;
+    }
+
+    const [conditionsKey] = conditionsProperty.children;
+    if (!conditionsKey || conditionsKey.type !== "string" || conditionsKey.value !== "conditions") {
+        return undefined;
+    }
+
+    const abilityValueObject = conditionsProperty.parent;
+    if (!abilityValueObject || !isAbilityEntryObjectContext(abilityValueObject)) {
+        return undefined;
+    }
+
+    return "condition";
+}
+
+function resolveKindFromPath(path: Array<string | number>): DocKind | undefined {
+    if (!path || !path.length) {
+        return undefined;
+    }
+
+    let sawAbilities = false;
+
+    for (let i = 0; i < path.length; i++) {
+        const segment = path[i];
+        if (segment === "abilities") {
+            sawAbilities = true;
+        }
+
+        if (
+            sawAbilities &&
+            segment === "conditions" &&
+            (path[i + 1] === "enabling" || path[i + 1] === "unlocking")
+        ) {
+            return "condition";
+        }
+    }
+
+    return sawAbilities ? "ability" : undefined;
 }
 
 function shouldAddTrailingComma(document: TextDocument, position: Position): boolean {
