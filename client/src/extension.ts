@@ -277,7 +277,7 @@ ${description}
 [[dependencies.${modId}]]
 modId = "palladium"
 mandatory = true
-versionRange = ">=4.2.1"
+versionRange = "[4.4.1,)"
 ordering = "NONE"
 side = "BOTH"
 `
