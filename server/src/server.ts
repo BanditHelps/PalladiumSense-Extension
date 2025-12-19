@@ -234,7 +234,26 @@ connection.onHover((params): Hover | null => {
 
     const context = resolveHoverContext(doc, params.position);
     if (context) {
-        const map = context.docKind === "condition" ? conditionMap : abilityMap;
+        // Special handling for body_part field in energy renderers
+        if (context.kind === "field" && context.docKind === "energy_renderer" && context.fieldName === "body_part") {
+            return {
+                contents: {
+                    kind: "markdown",
+                    value: [
+                        `### body_part`,
+                        `**Type:** String`,
+                        `**Required:** Yes`,
+                        `**Values:** head, head_overlay, chest, chest_overlay, right_arm, right_arm_overlay, left_arm, left_arm_overlay, right_leg, right_leg_overlay, left_leg, left_leg_overlay, cape`
+                    ].join("\n\n")
+                }
+            };
+        }
+
+        const map = context.docKind === "condition" 
+            ? conditionMap 
+            : context.docKind === "energy_renderer"
+                ? energyRendererMap
+                : abilityMap;
         const entry = map.get(context.entryId);
         if (entry) {
             if (context.kind === "field") {
@@ -242,6 +261,9 @@ connection.onHover((params): Hover | null => {
                 if (field) {
                     return formatFieldHover(entry, field, context.docKind);
                 }
+                // If we have a valid field context but no field definition, still return null
+                // to prevent falling through to word matching
+                return null;
             } else {
                 return formatEntryHover(entry, context.docKind);
             }
@@ -250,6 +272,15 @@ connection.onHover((params): Hover | null => {
 
     const word = extractWord(doc, params.position);
     if (!word) { return null; }
+
+    // Check if this is an energy beams document and try energy renderers first
+    if (isEnergyBeamsDocument(doc)) {
+        const renderer =
+            energyRendererMap.get(word) ?? energyRenderers.find(r => r.name === word || r.id.includes(word));
+        if (renderer) {
+            return formatEntryHover(renderer, "energy_renderer");
+        }
+    }
 
     const ability =
         abilityMap.get(word) ?? abilities.find(a => a.name === word || a.id.includes(word));
@@ -360,6 +391,7 @@ function resolveHoverContext(document: TextDocument, position: Position): HoverC
     }
 
     if (keyNode.value === "type" && valueNode?.type === "string" && isNodeWithin(node, valueNode)) {
+        // Use the determined docKind for the context, not hardcoded "ability"
         return { kind: "ability", docKind, entryId: String(valueNode.value) };
     }
 
@@ -476,11 +508,8 @@ function applyIndentationToSnippet(snippet: string, document: TextDocument, posi
     const prevCharLine = prevCharIdx !== undefined ? document.positionAt(prevCharIdx).line : undefined;
     const currentIndent = getLineIndent(text, position.line, document);
 
-    const normalizedSnippet = normalizeSnippetIndent(snippet);
-
     const reindentFromBase = (baseIndent: string): string => {
-        const lines = normalizedSnippet.split("\n");
-        return lines.map(line => `${baseIndent}${line}`).join("\n");
+        return reindentSnippetWithUnit(snippet, baseIndent, indentUnit);
     };
 
     // Case 1: cursor is right after "[" on the same line – break to new line and indent item.
@@ -494,15 +523,40 @@ function applyIndentationToSnippet(snippet: string, document: TextDocument, posi
         return `\n${indentedSnippet}`;
     }
 
-    // Case 3: cursor is after a "}" on the same line – start a new line aligned with previous item.
+    // Case 3a: cursor is after a "}" on the same line – start a new line aligned with previous item.
     if (prevChar === "}" && prevCharLine === position.line) {
         const previousIndent = getLineIndent(text, prevCharLine ?? position.line, document);
         const indentedSnippet = reindentFromBase(previousIndent);
         return `\n${indentedSnippet}`;
     }
 
-    // Case 2 (default): rely on editor indentation; return normalized snippet unchanged.
-    return normalizedSnippet;
+    // Case 3b: cursor is after a "," that follows a "}" on the same line (e.g., "},<cursor>")
+    if (prevChar === "," && prevCharLine === position.line) {
+        const beforeCommaIdx = prevCharIdx !== undefined ? findPreviousNonWhitespaceIndex(text, prevCharIdx - 1) : undefined;
+        const beforeCommaChar = beforeCommaIdx !== undefined ? text.charAt(beforeCommaIdx) : undefined;
+        if (beforeCommaChar === "}") {
+            const previousIndent = getLineIndent(text, prevCharLine ?? position.line, document);
+            const indentedSnippet = reindentFromBase(previousIndent);
+            return `\n${indentedSnippet}`;
+        }
+    }
+
+    // Case 4: cursor is on a new line after a previous element (e.g., pressed Enter after "},")
+    // The previous non-whitespace character is on a different line.
+    if (prevCharLine !== undefined && prevCharLine !== position.line) {
+        // If current line already has indentation, use that as the base
+        if (currentIndent) {
+            return reindentFromBase(currentIndent);
+        }
+        // Otherwise, use the calculated item-level indent
+        return reindentFromBase(itemIndent);
+    }
+
+    // Case 2 (default): cursor is on an indented line; use that indentation if present.
+    if (currentIndent) {
+        return reindentFromBase(currentIndent);
+    }
+    return reindentFromBase(itemIndent);
 }
 
 function isEnergyBeamsDocument(document: TextDocument): boolean {
@@ -605,6 +659,62 @@ function normalizeSnippetIndent(snippet: string): string {
     return lines
         .map(line => (line.length >= minIndent ? line.slice(minIndent) : line.trim() ? line.trimStart() : line))
         .join("\n");
+}
+
+/**
+ * Detects the indentation unit used within a snippet by finding the first indented line.
+ */
+function detectSnippetIndentUnit(snippet: string): string | undefined {
+    const lines = snippet.split("\n");
+    for (const line of lines) {
+        if (!line.trim()) {
+            continue;
+        }
+        const leading = line.match(/^([ \t]+)/);
+        if (leading) {
+            return leading[1];
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Reindents a snippet to use the target indentation unit instead of its original indentation.
+ * Also applies a base indentation to the entire snippet.
+ */
+function reindentSnippetWithUnit(
+    snippet: string,
+    baseIndent: string,
+    targetIndentUnit: string
+): string {
+    const snippetIndentUnit = detectSnippetIndentUnit(snippet);
+    const lines = snippet.split("\n");
+
+    return lines.map(line => {
+        if (!line.trim()) {
+            return line;
+        }
+
+        const leading = line.match(/^[ \t]*/)?.[0] ?? "";
+        const content = line.slice(leading.length);
+
+        if (!snippetIndentUnit || !leading) {
+            // No indentation or can't detect unit, just add base indent
+            return `${baseIndent}${content}`;
+        }
+
+        // Count how many indent units are in the leading whitespace
+        let depth = 0;
+        let remaining = leading;
+        while (remaining.startsWith(snippetIndentUnit)) {
+            depth++;
+            remaining = remaining.slice(snippetIndentUnit.length);
+        }
+
+        // Build new indentation: base + (depth * target unit)
+        const newIndent = baseIndent + targetIndentUnit.repeat(depth);
+        return `${newIndent}${content}`;
+    }).join("\n");
 }
 
 function isAbilityEntryObjectContext(objectNode: JsonNode): boolean {
@@ -764,6 +874,11 @@ function shouldAddTrailingComma(document: TextDocument, position: Position): boo
 }
 
 function determineDocKind(document: TextDocument, objectNode: JsonNode): DocKind | undefined {
+    // Check if this is an energy beams file first
+    if (isEnergyBeamsDocument(document)) {
+        return "energy_renderer";
+    }
+    
     const text = document.getText();
     const location = getLocation(text, objectNode.offset);
     return docKindFromPath(location.path);
@@ -1695,20 +1810,20 @@ function parseRequiredFlag(raw: string): boolean | undefined {
 function buildSnippetFromExample(example: string, kind: DocKind): { snippet: string; pretty: string } {
     try {
         const parsed = JSON.parse(example);
-        const snippetRoot =
-            kind === "ability"
-                ? cloneJsonValue(parsed)
-                : parsed;
+        const snippetRoot = cloneJsonValue(parsed);
 
         if (kind === "ability") {
             ensureAbilityConditions(snippetRoot);
+        } else if (kind === "energy_renderer") {
+            ensureEnergyRendererBodyPart(snippetRoot);
         }
 
         let tabIndex = 1;
+        const indentUnit = "    ";
 
         const renderValue = (value: unknown, depth: number): string => {
-            const indent = "    ".repeat(depth);
-            const nextIndent = "    ".repeat(depth + 1);
+            const indent = indentUnit.repeat(depth);
+            const nextIndent = indentUnit.repeat(depth + 1);
 
             if (Array.isArray(value)) {
                 if (!value.length) {
@@ -1773,6 +1888,49 @@ function ensureAbilityConditions(root: unknown): void {
 
     if (!Array.isArray(conditions["unlocking"])) {
         conditions["unlocking"] = [];
+    }
+}
+
+function ensureEnergyRendererBodyPart(root: unknown): void {
+    const assignBodyPart = (target: Record<string, unknown>) => {
+        if (Object.prototype.hasOwnProperty.call(target, "body_part")) {
+            return;
+        }
+
+        const entries = Object.entries(target);
+        const reordered: Record<string, unknown> = {};
+        let inserted = false;
+
+        for (const [key, value] of entries) {
+            reordered[key] = value;
+            if (!inserted && key === "type") {
+                reordered["body_part"] = "head";
+                inserted = true;
+            }
+        }
+
+        if (!inserted) {
+            reordered["body_part"] = "head";
+        }
+
+        // mutate original object in place to preserve references
+        Object.keys(target).forEach(key => delete target[key]);
+        Object.entries(reordered).forEach(([key, value]) => {
+            target[key] = value;
+        });
+    };
+
+    if (Array.isArray(root)) {
+        for (const item of root) {
+            if (isPlainObject(item)) {
+                assignBodyPart(item as Record<string, unknown>);
+            }
+        }
+        return;
+    }
+
+    if (isPlainObject(root)) {
+        assignBodyPart(root as Record<string, unknown>);
     }
 }
 
@@ -1870,7 +2028,7 @@ function createFallbackEnergyRenderers(): AbilityRecord[] {
         source: "fallback",
         example: `{
     "type": "palladium:laser",
-    "body_part": "right_arm",
+    "body_part": "head",
     "glow_color": "#114880",
     "core_color": "#257c12",
     "glow_opacity": 1,
@@ -1884,7 +2042,7 @@ function createFallbackEnergyRenderers(): AbilityRecord[] {
 }`,
         snippet: `{
     "type": "\${1:palladium:laser}",
-    "body_part": "\${2:right_arm}",
+    "body_part": "\${2:head}",
     "glow_color": "\${3:#114880}",
     "core_color": "\${4:#257c12}",
     "glow_opacity": \${5:1},
@@ -1908,7 +2066,7 @@ function createFallbackEnergyRenderers(): AbilityRecord[] {
         source: "fallback",
         example: `{
     "type": "palladium:lightning",
-    "body_part": "right_arm",
+    "body_part": "head",
     "glow_color": "#114880",
     "core_color": "#257c12",
     "glow_opacity": 0.75,
@@ -1925,7 +2083,7 @@ function createFallbackEnergyRenderers(): AbilityRecord[] {
 }`,
         snippet: `{
     "type": "\${1:palladium:lightning}",
-    "body_part": "\${2:right_arm}",
+    "body_part": "\${2:head}",
     "glow_color": "\${3:#114880}",
     "core_color": "\${4:#257c12}",
     "glow_opacity": \${5:0.75},
