@@ -28,6 +28,7 @@ interface InitOptions {
     docsRoot?: string;
     abilitiesFile?: string;
     conditionsFile?: string;
+    energyRendersFile?: string;
 }
 
 interface AbilityField {
@@ -65,7 +66,7 @@ type HoverContext =
     | { kind: "field"; docKind: DocKind; entryId: string; fieldName: string };
 
 const connection = createConnection(ProposedFeatures.all);
-type DocKind = "ability" | "condition";
+type DocKind = "ability" | "condition" | "energy_renderer";
 
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 const fsp = fs.promises;
@@ -74,6 +75,8 @@ let abilities: AbilityRecord[] = createFallbackAbilities();
 let abilityMap: Map<string, AbilityRecord> = buildAbilityMap(abilities);
 let conditions: AbilityRecord[] = [];
 let conditionMap: Map<string, AbilityRecord> = buildAbilityMap(conditions);
+let energyRenderers: AbilityRecord[] = createFallbackEnergyRenderers();
+let energyRendererMap: Map<string, AbilityRecord> = buildAbilityMap(energyRenderers);
 let preferredSources: InitOptions = {};
 
 interface WatchState {
@@ -84,7 +87,8 @@ interface WatchState {
 
 const watchStates: Record<DocKind, WatchState> = {
     ability: { watcher: null, target: null, timer: null },
-    condition: { watcher: null, target: null, timer: null }
+    condition: { watcher: null, target: null, timer: null },
+    energy_renderer: { watcher: null, target: null, timer: null }
 };
 
 const DIAGNOSTIC_SOURCE = "palladium";
@@ -95,11 +99,13 @@ connection.onInitialize(async (params: InitializeParams) => {
         docsRoot: params.initializationOptions?.docsRoot,
         abilitiesFile: params.initializationOptions?.abilitiesFile,
         conditionsFile: params.initializationOptions?.conditionsFile,
+        energyRendersFile: params.initializationOptions?.energyRendersFile
     };
 
     await Promise.all([
         reloadAbilities("initial load"),
-        reloadConditions("initial load")
+        reloadConditions("initial load"),
+        reloadEnergyRenderers("initial load")
     ]);
 
     return {
@@ -117,6 +123,7 @@ connection.onInitialize(async (params: InitializeParams) => {
 connection.onShutdown(() => {
     disposeWatcher("ability");
     disposeWatcher("condition");
+    disposeWatcher("energy_renderer");
 });
 
 connection.onDidChangeWatchedFiles(event => {
@@ -147,9 +154,32 @@ connection.onCompletion(
             return [];
         }
 
+        const energyFieldContext = resolveEnergyRendererFieldCompletionContext(doc, params.position);
+        if (energyFieldContext) {
+            return buildAbilityFieldCompletions(energyFieldContext);
+        }
+
         const fieldContext = resolveAbilityFieldCompletionContext(doc, params.position);
         if (fieldContext) {
             return buildAbilityFieldCompletions(fieldContext);
+        }
+
+        if (shouldOfferEnergyRendererSnippets(doc, params.position)) {
+            const needsComma = shouldAddTrailingComma(doc, params.position);
+            return energyRenderers.map(r => ({
+                label: r.name,
+                kind: CompletionItemKind.Snippet,
+                detail: r.id,
+                filterText: `${r.name} ${r.id}`,
+                sortText: r.name.toLowerCase(),
+                documentation: buildDocumentationSummary(r),
+                insertTextFormat: InsertTextFormat.Snippet,
+                insertText: applyIndentationToSnippet(
+                    needsComma ? `${r.snippet},` : r.snippet,
+                    doc,
+                    params.position
+                ),
+            }));
         }
 
         const ctx = resolveSnippetCompletionContext(doc, params.position);
@@ -237,7 +267,12 @@ documents.listen(connection);
 connection.listen();
 
 function formatEntryHover(entry: AbilityRecord, kind: DocKind): Hover {
-    const label = kind === "condition" ? "Condition" : "Ability";
+    const label =
+        kind === "condition"
+            ? "Condition"
+            : kind === "energy_renderer"
+                ? "Energy Renderer"
+                : "Ability";
     const lines = [
         `### ${entry.name}`,
         `**${label} ID:** ${entry.id}`,
@@ -258,7 +293,12 @@ function formatEntryHover(entry: AbilityRecord, kind: DocKind): Hover {
 }
 
 function formatFieldHover(entry: AbilityRecord, field: AbilityField, kind: DocKind): Hover {
-    const label = kind === "condition" ? "Condition" : "Ability";
+    const label =
+        kind === "condition"
+            ? "Condition"
+            : kind === "energy_renderer"
+                ? "Energy Renderer"
+                : "Ability";
     const metaLines = [
         `**${label}:** ${entry.id}`,
         field.type ? `**Type:** ${field.type}` : undefined,
@@ -370,6 +410,31 @@ function resolveSnippetCompletionContext(document: TextDocument, position: Posit
     return docKindFromPath ?? undefined;
 }
 
+function shouldOfferEnergyRendererSnippets(document: TextDocument, position: Position): boolean {
+    if (!isEnergyBeamsDocument(document)) {
+        return false;
+    }
+
+    const text = document.getText();
+    const offset = document.offsetAt(position);
+    const tree = parseTree(text);
+    const location = getLocation(text, offset);
+    if (!tree) {
+        return false;
+    }
+
+    const node = findNodeAtOffset(tree, offset, true) ?? location.previousNode;
+
+    // Don't offer renderer-object snippets while cursor is inside an existing renderer object.
+    const objectNode = getEnclosingObject(node);
+    if (objectNode && isEnergyBeamEntryObjectContext(objectNode)) {
+        return false;
+    }
+
+    const arrayNode = findEnclosingArrayNode(document, position);
+    return !!arrayNode && isEnergyBeamRootArrayContext(arrayNode);
+}
+
 function isOffsetInsideNode(offset: number, node: JsonNode): boolean {
     const start = node.offset;
     const end = node.offset + (node.length ?? 0);
@@ -391,7 +456,10 @@ function findEnclosingArrayNode(document: TextDocument, position: Position): Jso
 
 function applyIndentationToSnippet(snippet: string, document: TextDocument, position: Position): string {
     const arrayNode = findEnclosingArrayNode(document, position);
-    if (!arrayNode || isConditionArrayContext(arrayNode) !== "condition") {
+    const shouldIndent =
+        !!arrayNode &&
+        (isConditionArrayContext(arrayNode) === "condition" || (isEnergyBeamsDocument(document) && isEnergyBeamRootArrayContext(arrayNode)));
+    if (!arrayNode || !shouldIndent) {
         return snippet;
     }
 
@@ -435,6 +503,32 @@ function applyIndentationToSnippet(snippet: string, document: TextDocument, posi
 
     // Case 2 (default): rely on editor indentation; return normalized snippet unchanged.
     return normalizedSnippet;
+}
+
+function isEnergyBeamsDocument(document: TextDocument): boolean {
+    try {
+        const fsPath = fileURLToPath(document.uri);
+        return isEnergyBeamsFilePath(fsPath);
+    } catch {
+        return false;
+    }
+}
+
+function isEnergyBeamsFilePath(fsPath: string): boolean {
+    const normalized = fsPath.replace(/\\/g, "/").toLowerCase();
+    return /\/assets\/[^\/]+\/palladium\/energy_beams(\/|$)/.test(normalized);
+}
+
+function isEnergyBeamEntryObjectContext(objectNode: JsonNode): boolean {
+    if (objectNode.type !== "object") {
+        return false;
+    }
+    const arrayNode = objectNode.parent;
+    return !!arrayNode && arrayNode.type === "array" && isEnergyBeamRootArrayContext(arrayNode);
+}
+
+function isEnergyBeamRootArrayContext(arrayNode: JsonNode): boolean {
+    return arrayNode.type === "array" && !arrayNode.parent;
 }
 
 function getLineIndent(text: string, line: number, document: TextDocument): string {
@@ -882,6 +976,67 @@ function resolveAbilityFieldCompletionContext(
     };
 }
 
+function resolveEnergyRendererFieldCompletionContext(
+    document: TextDocument,
+    position: Position
+): AbilityFieldCompletionContext | undefined {
+    if (!isEnergyBeamsDocument(document)) {
+        return undefined;
+    }
+
+    const text = document.getText();
+    const offset = document.offsetAt(position);
+    const location = getLocation(text, offset);
+
+    const tree = parseTree(text);
+    if (!tree) {
+        return undefined;
+    }
+
+    const node = findNodeAtOffset(tree, offset, true);
+    if (!node) {
+        return undefined;
+    }
+
+    const objectNode = getEnclosingObject(node);
+    if (!objectNode || !isEnergyBeamEntryObjectContext(objectNode)) {
+        return undefined;
+    }
+
+    const isKeyPosition = location.isAtPropertyKey || node === objectNode;
+    if (!isKeyPosition) {
+        return undefined;
+    }
+
+    const typeId = findTypeIdentifier(objectNode);
+    if (!typeId) {
+        return undefined;
+    }
+
+    const renderer = energyRendererMap.get(typeId);
+    if (!renderer || renderer.fields.length === 0) {
+        return undefined;
+    }
+
+    const propertyNode =
+        node === objectNode
+            ? undefined
+            : getPropertyNode(node);
+
+    if (propertyNode && propertyNode.parent !== objectNode) {
+        return undefined;
+    }
+
+    const keyNode = propertyNode?.children?.[0];
+    const replaceRange = computePropertyKeyReplaceRange(document, position, text, location, keyNode);
+
+    return {
+        ability: renderer,
+        replaceRange,
+        usedFields: collectUsedFieldNames(objectNode, propertyNode),
+    };
+}
+
 function buildAbilityFieldCompletions(context: AbilityFieldCompletionContext): CompletionItem[] {
     const items: CompletionItem[] = [];
 
@@ -1225,6 +1380,26 @@ async function reloadConditions(reason?: string): Promise<void> {
     }
 }
 
+async function reloadEnergyRenderers(reason?: string): Promise<void> {
+    try {
+        const { entries, watchTarget } = await resolveEnergyRenderers(preferredSources);
+        energyRenderers = entries.length ? entries : createFallbackEnergyRenderers();
+        energyRendererMap = buildAbilityMap(energyRenderers);
+
+        configureWatcher("energy_renderer", watchTarget ?? null);
+        connection.console.info(
+            `[Energy Renderers] Loaded ${energyRenderers.length} entries${reason ? ` (${reason})` : ""}`
+        );
+    } catch (error) {
+        connection.console.error(`[Energy Renderers] Failed to load: ${formatError(error)}`);
+        energyRenderers = createFallbackEnergyRenderers();
+        energyRendererMap = buildAbilityMap(energyRenderers);
+        configureWatcher("energy_renderer", getDocsFolderWatchTarget());
+    } finally {
+        validateAllDocuments();
+    }
+}
+
 async function resolveAbilities(config: InitOptions): Promise<ResolveResult> {
     const abilityFile = getAbilityFilePath(config);
     if (abilityFile && await fileExists(abilityFile)) {
@@ -1247,6 +1422,31 @@ async function resolveConditions(config: InitOptions): Promise<ResolveResult> {
 
     const watchTarget = config.docsRoot ? { kind: "folder" as const, path: config.docsRoot } : null;
     return { entries: [], watchTarget };
+}
+
+async function resolveEnergyRenderers(config: InitOptions): Promise<ResolveResult> {
+    const direct = config.energyRendersFile;
+    if (direct && await fileExists(direct)) {
+        const entries = await loadFromFile(direct, path.basename(direct), "energy_renderer");
+        return { entries, watchTarget: { kind: "file" as const, path: direct } };
+    }
+
+    if (config.docsRoot) {
+        const candidates = [
+            path.join(config.docsRoot, "energy_render_beams.html"),
+            path.join(config.docsRoot, "energy_beam_renderers.html"),
+        ];
+
+        for (const candidate of candidates) {
+            if (await fileExists(candidate)) {
+                const entries = await loadFromFile(candidate, path.basename(candidate), "energy_renderer");
+                return { entries, watchTarget: { kind: "file" as const, path: candidate } };
+            }
+        }
+    }
+
+    const watchTarget = config.docsRoot ? { kind: "folder" as const, path: config.docsRoot } : null;
+    return { entries: createFallbackEnergyRenderers(), watchTarget };
 }
 
 async function loadFromFile(filePath: string, sourceLabel: string, docKind: DocKind): Promise<AbilityRecord[]> {
@@ -1275,12 +1475,7 @@ function parseAbilityHtml(html: string, sourceLabel: string, docKind: DocKind): 
             return;
         }
 
-        const snippetElement = block.find("pre.json-snippet").first();
-        if (!snippetElement.length) {
-            return;
-        }
-
-        const exampleRaw = snippetElement.text().trim();
+        const exampleRaw = extractExampleSnippet($, block);
         if (!exampleRaw) {
             return;
         }
@@ -1288,7 +1483,8 @@ function parseAbilityHtml(html: string, sourceLabel: string, docKind: DocKind): 
         const name = block.find("h2").first().text().trim() || id;
         const description = block.find("p").first().text().trim();
         const fields = parseAbilityFields($, block);
-        const fieldIndex = new Map(fields.map(field => [field.name, field]));
+        const inferredFields = fields.length ? fields : inferFieldsFromExample(exampleRaw);
+        const fieldIndex = new Map(inferredFields.map(field => [field.name, field]));
         const { snippet, pretty } = buildSnippetFromExample(exampleRaw, docKind);
 
         result.push({
@@ -1298,7 +1494,7 @@ function parseAbilityHtml(html: string, sourceLabel: string, docKind: DocKind): 
             example: pretty,
             description,
             source: sourceLabel,
-            fields,
+            fields: inferredFields,
             fieldIndex
         });
     });
@@ -1317,30 +1513,36 @@ function parseAbilityFields(
         const headers = table
             .find("thead th")
             .toArray()
-            .map(header => $(header).text().trim().toLowerCase());
+            .map(header => normalizeHeaderName($(header).text()));
 
-        if (!headers.length || headers[0] !== "setting") {
+        if (!headers.length) {
             continue;
         }
+
+        const nameIdx = headers.findIndex(h => h === "setting" || h === "property" || h === "field");
+        if (nameIdx === -1) {
+            continue;
+        }
+
+        const typeIdx = headers.findIndex(h => h === "type");
+        const descriptionIdx = headers.findIndex(h => h === "description" || h === "details");
+        const requiredIdx = headers.findIndex(h => h === "required");
+        const fallbackIdx = headers.findIndex(h => h.startsWith("default") || h.startsWith("fallback"));
 
         const rows = table.find("tbody tr");
         const fields: AbilityField[] = [];
 
         rows.each((_rowIdx, row) => {
             const cells = $(row).find("td").toArray();
-            if (cells.length < 5) {
-                return;
-            }
-
-            const name = extractCellText($(cells[0]));
+            const name = pickCellText(cells, nameIdx, $);
             if (!name) {
                 return;
             }
 
-            const type = extractCellText($(cells[1]));
-            const description = extractCellText($(cells[2]));
-            const required = parseRequiredFlag(extractCellText($(cells[3])));
-            const fallback = extractCellText($(cells[4]));
+            const type = pickCellText(cells, typeIdx, $);
+            const description = pickCellText(cells, descriptionIdx, $);
+            const required = parseRequiredFlag(pickCellText(cells, requiredIdx, $) ?? "");
+            const fallback = pickCellText(cells, fallbackIdx, $);
 
             fields.push({
                 name,
@@ -1351,10 +1553,123 @@ function parseAbilityFields(
             });
         });
 
-        return fields;
+        if (fields.length) {
+            return fields;
+        }
     }
 
     return [];
+}
+
+function normalizeHeaderName(raw: string): string {
+    return raw.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function pickCellText(cells: unknown[], idx: number, $: cheerio.CheerioAPI): string | undefined {
+    if (idx < 0 || idx >= cells.length) {
+        return undefined;
+    }
+    return extractCellText($(cells[idx] as any)) || undefined;
+}
+
+function extractExampleSnippet(
+    $: cheerio.CheerioAPI,
+    block: cheerio.Cheerio<any>
+): string | undefined {
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+
+    const pushCandidate = (raw: string | undefined) => {
+        const text = raw?.trim();
+        if (!text || seen.has(text)) {
+            return;
+        }
+        seen.add(text);
+        candidates.push(text);
+    };
+
+    pushCandidate(block.find("pre.json-snippet").first().text());
+
+    block.find("pre code").each((_idx, el) => pushCandidate($(el).text()));
+    block.find("pre").each((_idx, el) => pushCandidate($(el).text()));
+
+    for (const candidate of candidates) {
+        if (isJsonLike(candidate)) {
+            return candidate;
+        }
+    }
+
+    return undefined;
+}
+
+function isJsonLike(text: string): boolean {
+    return tryParseJsonAny(text) !== undefined;
+}
+
+function tryParseJsonAny(text: string): unknown | undefined {
+    if (!text.trim()) {
+        return undefined;
+    }
+    try {
+        return JSON.parse(text);
+    } catch {
+        return undefined;
+    }
+}
+
+function inferFieldsFromExample(exampleRaw: string): AbilityField[] {
+    const parsed = tryParseJsonAny(exampleRaw);
+    if (!parsed) {
+        return [];
+    }
+
+    let target = parsed;
+    if (Array.isArray(parsed) && parsed.length) {
+        const first = parsed[0];
+        if (isPlainObject(first)) {
+            target = first;
+        }
+    }
+
+    if (!isPlainObject(target)) {
+        return [];
+    }
+
+    return Object.entries(target as Record<string, unknown>).map(([name, value]) => ({
+        name,
+        type: describeValueType(value),
+        description: undefined,
+        required: true,
+        fallback: formatFallbackValue(value),
+    }));
+}
+
+function describeValueType(value: unknown): string | undefined {
+    if (value === null) {
+        return "null";
+    }
+    if (Array.isArray(value)) {
+        return "array";
+    }
+    const kind = typeof value;
+    if (kind === "object") {
+        return "object";
+    }
+    return kind;
+}
+
+function formatFallbackValue(value: unknown): string | undefined {
+    if (value === null) {
+        return "null";
+    }
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        return String(value);
+    }
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return undefined;
+    }
 }
 
 function extractCellText(cell: cheerio.Cheerio<any>): string {
@@ -1526,6 +1841,112 @@ function getConditionFilePath(config: InitOptions = preferredSources): string | 
     return undefined;
 }
 
+function createFallbackEnergyRenderers(): AbilityRecord[] {
+    const commonFields: AbilityField[] = [
+        { name: "type", type: "string", description: "Renderer type id" },
+        { name: "body_part", type: "string" },
+        { name: "glow_color", type: "string" },
+        { name: "core_color", type: "string" },
+        { name: "glow_opacity", type: "number" },
+        { name: "core_opacity", type: "number" },
+        { name: "size", type: "vec2/array" },
+        { name: "bloom", type: "number" },
+        { name: "rotation", type: "number" },
+        { name: "rotation_speed", type: "number" },
+        { name: "offset", type: "vec3/array" },
+        { name: "normal_transparency", type: "boolean" },
+    ];
+
+    const lightningExtra: AbilityField[] = [
+        { name: "segments", type: "number" },
+        { name: "frequency", type: "number" },
+        { name: "spread", type: "number" },
+    ];
+
+    const laser: AbilityRecord = {
+        id: "palladium:laser",
+        name: "Laser",
+        description: "Fallback energy beam renderer snippet (real entries load from documentation).",
+        source: "fallback",
+        example: `{
+    "type": "palladium:laser",
+    "body_part": "right_arm",
+    "glow_color": "#114880",
+    "core_color": "#257c12",
+    "glow_opacity": 1,
+    "core_opacity": 0.5,
+    "size": [4, 4],
+    "bloom": 0,
+    "rotation": 10,
+    "rotation_speed": 20,
+    "offset": [-1, -11, 0],
+    "normal_transparency": true
+}`,
+        snippet: `{
+    "type": "\${1:palladium:laser}",
+    "body_part": "\${2:right_arm}",
+    "glow_color": "\${3:#114880}",
+    "core_color": "\${4:#257c12}",
+    "glow_opacity": \${5:1},
+    "core_opacity": \${6:0.5},
+    "size": [\${7:4}, \${8:4}],
+    "bloom": \${9:0},
+    "rotation": \${10:10},
+    "rotation_speed": \${11:20},
+    "offset": [\${12:-1}, \${13:-11}, \${14:0}],
+    "normal_transparency": \${15:true}
+}`,
+        fields: commonFields,
+        fieldIndex: new Map(commonFields.map(field => [field.name, field])),
+    };
+
+    const lightningFields = [...commonFields, ...lightningExtra];
+    const lightning: AbilityRecord = {
+        id: "palladium:lightning",
+        name: "Lightning",
+        description: "Fallback energy beam renderer snippet (real entries load from documentation).",
+        source: "fallback",
+        example: `{
+    "type": "palladium:lightning",
+    "body_part": "right_arm",
+    "glow_color": "#114880",
+    "core_color": "#257c12",
+    "glow_opacity": 0.75,
+    "core_opacity": 0.25,
+    "size": [3, 2],
+    "segments": 20,
+    "frequency": 12,
+    "spread": 1,
+    "bloom": 1,
+    "rotation": 10,
+    "rotation_speed": 20,
+    "offset": [-1, -11, 0],
+    "normal_transparency": true
+}`,
+        snippet: `{
+    "type": "\${1:palladium:lightning}",
+    "body_part": "\${2:right_arm}",
+    "glow_color": "\${3:#114880}",
+    "core_color": "\${4:#257c12}",
+    "glow_opacity": \${5:0.75},
+    "core_opacity": \${6:0.25},
+    "size": [\${7:3}, \${8:2}],
+    "segments": \${9:20},
+    "frequency": \${10:12},
+    "spread": \${11:1},
+    "bloom": \${12:1},
+    "rotation": \${13:10},
+    "rotation_speed": \${14:20},
+    "offset": [\${15:-1}, \${16:-11}, \${17:0}],
+    "normal_transparency": \${18:true}
+}`,
+        fields: lightningFields,
+        fieldIndex: new Map(lightningFields.map(field => [field.name, field])),
+    };
+
+    return [laser, lightning];
+}
+
 async function fileExists(filePath?: string): Promise<boolean> {
     if (!filePath) {
         return false;
@@ -1622,7 +2043,12 @@ function scheduleReload(kind: DocKind, reason?: string) {
     }
 
     state.timer = setTimeout(() => {
-        const reloadFn = kind === "condition" ? reloadConditions : reloadAbilities;
+        const reloadFn =
+            kind === "condition"
+                ? reloadConditions
+                : kind === "energy_renderer"
+                    ? reloadEnergyRenderers
+                    : reloadAbilities;
         reloadFn(reason).catch(err => {
             connection.console.error(`[${label}] Reload failed: ${formatError(err)}`);
         });
@@ -1667,6 +2093,16 @@ function detectDocKindsForPath(fsPath: string): DocKind[] {
         matches.push("condition");
     }
 
+    if (
+        matchesTarget(normalized, watchStates.energy_renderer.target) ||
+        (preferredSources.docsRoot &&
+            (matchesExpectedPath(normalized, path.join(preferredSources.docsRoot, "energy_render_beams.html")) ||
+                matchesExpectedPath(normalized, path.join(preferredSources.docsRoot, "energy_beam_renderers.html")))) ||
+        matchesExpectedPath(normalized, preferredSources.energyRendersFile)
+    ) {
+        matches.push("energy_renderer");
+    }
+
     return matches;
 }
 
@@ -1693,5 +2129,12 @@ function normalizeFsPath(value: string): string {
 }
 
 function labelForKind(kind: DocKind): string {
-    return kind === "condition" ? "Conditions" : "Abilities";
+    switch (kind) {
+        case "condition":
+            return "Conditions";
+        case "energy_renderer":
+            return "Energy Renderers";
+        default:
+            return "Abilities";
+    }
 }

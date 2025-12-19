@@ -46,7 +46,9 @@ export async function activate(context: vscode.ExtensionContext) {
         initializationOptions: {
             docsRoot,
             abilitiesFile: docsRoot ? path.join(docsRoot, "abilities.html") : undefined,
-            conditionsFile: docsRoot ? path.join(docsRoot, "conditions.html") : undefined
+            conditionsFile: docsRoot ? path.join(docsRoot, "conditions.html") : undefined,
+            // Server resolves both energy_render_beams.html and energy_beam_renderers.html automatically.
+            energyRendersFile: undefined,
         }
     };
 
@@ -865,6 +867,9 @@ async function loadDocumentationSections(docsRoot: vscode.Uri): Promise<DocSecti
 
     pushSpecial("abilities.html", "Abilities");
     pushSpecial("conditions.html", "Conditions");
+    pushSpecial("energy_render_beams.html", "Energy Render Beams");
+    pushSpecial("energy_beam_renderers.html", "Energy_Beam_Renders");
+
 
     Array.from(normalized.values())
         .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }))
